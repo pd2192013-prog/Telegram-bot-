@@ -2,13 +2,9 @@
 // TELEGRAM MATH BOT — Cloudflare Worker (single file)
 // Sirf likhit Math ke sawalon ka jawab deta hai (Gemini API se)
 // Rate limit: 15 sawal / 1 ghanta / user
+// BOT_TOKEN, GEMINI_API_KEY, GEMINI_MODEL Cloudflare "Secrets" se aate hain
+// (Settings -> Runtime variables and secrets)
 // =========================================================
-
-// ---- CONFIG ----
-// ⚠️ GEMINI_API_KEY yahan asli Gemini API key honi chahiye (AIzaSy... se shuru hoti hai).
-const BOT_TOKEN = "8961031495:AAHIb_LcAREim_2g0-FlbXGv1LU866o_T4w";
-const GEMINI_API_KEY = "AQ.Ab8RN6J99s8hsukqLZzBjrh_pYfSlqYaRagSni1x3Y39QAajHQ";
-const GEMINI_MODEL = "gemini-3.5-flash-lite";
 
 const RATE_LIMIT_COUNT = 15;
 const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 ghanta
@@ -44,8 +40,8 @@ function sleep(ms) {
 }
 
 // ---- Helper: Telegram ko message bhejo ----
-async function sendMessage(chatId, text) {
-  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+async function sendMessage(env, chatId, text) {
+  const url = `https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`;
   await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -57,9 +53,9 @@ async function sendMessage(chatId, text) {
 }
 
 // ---- Helper: "typing..." dikhane ke liye ----
-async function sendTyping(chatId) {
+async function sendTyping(env, chatId) {
   try {
-    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendChatAction`, {
+    await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendChatAction`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, action: "typing" }),
@@ -70,16 +66,16 @@ async function sendTyping(chatId) {
 }
 
 // ---- Gemini se jawab lete waqt "typing..." dikhate rehna ----
-async function askGeminiWithTyping(chatId, question) {
+async function askGeminiWithTyping(env, chatId, question) {
   let finished = false;
-  const geminiPromise = askGemini(question).then((res) => {
+  const geminiPromise = askGemini(env, question).then((res) => {
     finished = true;
     return res;
   });
 
   (async () => {
     while (!finished) {
-      await sendTyping(chatId);
+      await sendTyping(env, chatId);
       await sleep(4000);
     }
   })();
@@ -135,8 +131,8 @@ async function checkRateLimit(env, userId) {
 }
 
 // ---- Gemini API call ----
-async function askGemini(question) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+async function askGemini(env, question) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${env.GEMINI_MODEL}:generateContent`;
 
   const body = {
     system_instruction: {
@@ -153,22 +149,24 @@ async function askGemini(question) {
   try {
     const res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": env.GEMINI_API_KEY,
+      },
       body: JSON.stringify(body),
     });
 
     const data = await res.json();
 
     if (!res.ok) {
-      console.log("Gemini API error:", res.status, JSON.stringify(data));
-      return GENERIC_ERROR_REPLY;
+      // TEMPORARY DEBUG: asli error seedha Telegram me dikhega
+      return `DEBUG ERROR (status ${res.status}): ${JSON.stringify(data)}`;
     }
 
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
     return text ? text.trim() : GENERIC_ERROR_REPLY;
   } catch (err) {
-    console.log("Gemini fetch error:", err.message);
-    return GENERIC_ERROR_REPLY;
+    return `DEBUG FETCH ERROR: ${err.message}`;
   }
 }
 
@@ -181,7 +179,7 @@ export default {
     if (url.pathname === "/setWebhook") {
       const webhookUrl = `${url.origin}/webhook`;
       const res = await fetch(
-        `https://api.telegram.org/bot${BOT_TOKEN}/setWebhook?url=${encodeURIComponent(
+        `https://api.telegram.org/bot${env.BOT_TOKEN}/setWebhook?url=${encodeURIComponent(
           webhookUrl
         )}`
       );
@@ -210,7 +208,7 @@ export default {
 
       // Agar photo/image bheji hai to seedha fixed reply do, Gemini ko mat bhejo
       if (message.photo || message.document) {
-        ctx.waitUntil(sendMessage(chatId, PHOTO_REPLY));
+        ctx.waitUntil(sendMessage(env, chatId, PHOTO_REPLY));
         return new Response("ok");
       }
 
@@ -232,7 +230,7 @@ export default {
 async function handleMessage(env, chatId, userId, text) {
   try {
     if (text === "/start") {
-      await sendMessage(chatId, START_REPLY);
+      await sendMessage(env, chatId, START_REPLY);
       return;
     }
 
@@ -241,16 +239,16 @@ async function handleMessage(env, chatId, userId, text) {
     if (!rateCheck.allowed) {
       const resetTimeStr = formatResetTime(rateCheck.resetTime);
       await sendMessage(
+        env,
         chatId,
         `आप मुझसे एक घंटे में केवल 15 सवाल पूछ सकते हैं, अभी आपकी सीमा समाप्त हो चुकी है। कृपया ${resetTimeStr} के बाद पुनः प्रयास करें।`
       );
       return;
     }
 
-    const answer = await askGeminiWithTyping(chatId, text);
-    await sendMessage(chatId, answer);
+    const answer = await askGeminiWithTyping(env, chatId, text);
+    await sendMessage(env, chatId, answer);
   } catch (err) {
-    console.log("handleMessage error:", err.message);
-    await sendMessage(chatId, GENERIC_ERROR_REPLY);
+    await sendMessage(env, chatId, `DEBUG HANDLE ERROR: ${err.message}`);
   }
 }
