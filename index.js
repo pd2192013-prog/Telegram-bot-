@@ -6,9 +6,9 @@
 // =========================================================
 
 // ⚠️ Neeche teeno values khud bharein:
-const BOT_TOKEN = "8961031495:AAEZncwlq5ZHKTDOwuO8rjRlGn1VkLDf-0g";
-const GEMINI_API_KEY = "AQ.Ab8RN6Jrz-VVnx0zcP9aR684XmyLxlR5KwD0VEHOZxkD0oRt6Q";
-const GEMINI_MODEL = "gemini-3.5-flash-lite"; // jaise gemini-2.5-flash
+const BOT_TOKEN = "secret_variable";
+const GEMINI_API_KEY = "secret_variable";
+const GEMINI_MODEL = "secret_variable";
 
 const RATE_LIMIT_COUNT = 15;
 const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 ghanta
