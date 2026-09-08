@@ -1,8 +1,0 @@
-name = "math-gemini-bot"
-main = "index.js"
-compatibility_date = "2024-02-20"
-
-# यह KV Database है जो यूजर की 15 सवालों की लिमिट याद रखेगा
-[[kv_namespaces]]
-binding = "RATE_LIMIT_KV"
-id = "5c84e6fcca79410b869162d9606057e8"
