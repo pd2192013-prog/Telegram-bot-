@@ -5,8 +5,8 @@
 // =========================================================
 
 const BOT_TOKEN = "8961031495:AAEZncwlq5ZHKTDOwuO8rjRlGn1VkLDf-0g";
-const GEMINI_API_KEY = "AQ.Ab8RN6KC4BfXDLXFTuS2iZ-TMQIHczUlQ0BsNJmA6toXb51Uyw";
-const GEMINI_MODEL = "gemini-3.5-flash-lite";
+const OPENROUTER_API_KEY = "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";
+const OPENROUTER_MODEL = "google/gemma-4-26b-a4b-it:free";
 
 const RATE_LIMIT_COUNT = 15;
 const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 ghanta
@@ -141,19 +141,15 @@ async function checkRateLimit(env, userId) {
   return { allowed: true };
 }
 
-// ---- Gemini API call ----
+// ---- OpenRouter API call ----
 async function askGemini(question) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+  const url = `https://openrouter.ai/api/v1/chat/completions`;
 
   const body = {
-    system_instruction: {
-      parts: [{ text: SYSTEM_PROMPT }],
-    },
-    contents: [
-      {
-        role: "user",
-        parts: [{ text: question }],
-      },
+    model: OPENROUTER_MODEL,
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: question },
     ],
   };
 
@@ -162,7 +158,7 @@ async function askGemini(question) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${GEMINI_API_KEY}`,
+        "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
       },
       body: JSON.stringify(body),
     });
@@ -174,7 +170,7 @@ async function askGemini(question) {
       return `DEBUG ERROR (status ${res.status}): ${JSON.stringify(data)}`;
     }
 
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    const text = data?.choices?.[0]?.message?.content;
     return text ? text.trim() : GENERIC_ERROR_REPLY;
   } catch (err) {
     return `DEBUG FETCH ERROR: ${err.message}`;
@@ -202,8 +198,25 @@ export default {
       } catch (e) {
         kvCheck = `KV failed: ${e.message}`;
       }
+      let openRouterCheck = "not tested";
+      try {
+        const r2 = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+          },
+          body: JSON.stringify({
+            model: OPENROUTER_MODEL,
+            messages: [{ role: "user", content: "2+2 kitna hota hai, ek shabd me jawab do" }],
+          }),
+        });
+        openRouterCheck = await r2.json();
+      } catch (e) {
+        openRouterCheck = `fetch failed: ${e.message}`;
+      }
       return new Response(
-        JSON.stringify({ telegramCheck, kvCheck }, null, 2),
+        JSON.stringify({ telegramCheck, kvCheck, openRouterCheck }, null, 2),
         { headers: { "Content-Type": "application/json" } }
       );
     }
