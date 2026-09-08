@@ -5,10 +5,24 @@
 // Rate limit: 15 sawal / 1 ghanta / user
 // =========================================================
 
-// ⚠️ Neeche teeno values khud bharein:
-const BOT_TOKEN = "secret_variable";
-const GEMINI_API_KEY = "secret_variable";
-const GEMINI_MODEL = "secret_variable";
+// ⚠️ Ye teeno values ab seedha yahan likhne ki zaroorat nahi hai.
+// Cloudflare Worker ke Settings → Variables and Secrets me
+// BOT_TOKEN, GEMINI_API_KEY aur GEMINI_MODEL naam se secret add karein,
+// code automatically wahi values use kar lega.
+// (Agar aap chahte hain to yahan neeche bhi bhar sakte hain — ye sirf
+// fallback hai, jab Cloudflare secret na mila ho tab hi use hoga.)
+const BOT_TOKEN_FALLBACK = "YAHAN_APNA_TELEGRAM_BOT_TOKEN_DALEIN";
+const GEMINI_API_KEY_FALLBACK = "YAHAN_APNI_GEMINI_API_KEY_DALEIN";
+const GEMINI_MODEL_FALLBACK = "YAHAN_APNA_MODEL_NAAM_DALEIN"; // jaise gemini-2.5-flash
+
+// ---- Helper: env se ya fallback se config value lo ----
+function getConfig(env) {
+  return {
+    BOT_TOKEN: (env && env.BOT_TOKEN) || BOT_TOKEN_FALLBACK,
+    GEMINI_API_KEY: (env && env.GEMINI_API_KEY) || GEMINI_API_KEY_FALLBACK,
+    GEMINI_MODEL: (env && env.GEMINI_MODEL) || GEMINI_MODEL_FALLBACK,
+  };
+}
 
 const RATE_LIMIT_COUNT = 15;
 const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 ghanta
@@ -44,7 +58,8 @@ function sleep(ms) {
 }
 
 // ---- Helper: Telegram ko message bhejo ----
-async function sendMessage(chatId, text) {
+async function sendMessage(env, chatId, text) {
+  const { BOT_TOKEN } = getConfig(env);
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
   await fetch(url, {
     method: "POST",
@@ -57,7 +72,8 @@ async function sendMessage(chatId, text) {
 }
 
 // ---- Helper: "typing..." dikhane ke liye ----
-async function sendTyping(chatId) {
+async function sendTyping(env, chatId) {
+  const { BOT_TOKEN } = getConfig(env);
   try {
     await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendChatAction`, {
       method: "POST",
@@ -70,16 +86,16 @@ async function sendTyping(chatId) {
 }
 
 // ---- Gemini se jawab lete waqt "typing..." dikhate rehna ----
-async function askGeminiWithTyping(chatId, question) {
+async function askGeminiWithTyping(env, chatId, question) {
   let finished = false;
-  const geminiPromise = askGemini(question).then((res) => {
+  const geminiPromise = askGemini(env, question).then((res) => {
     finished = true;
     return res;
   });
 
   (async () => {
     while (!finished) {
-      await sendTyping(chatId);
+      await sendTyping(env, chatId);
       await sleep(4000);
     }
   })();
@@ -146,7 +162,8 @@ async function checkRateLimit(env, userId) {
 // NOTE: Agar aapki key "AQ." se shuru hoti hai (naya Google "Auth key" format),
 // to Google ke server-side bug ki wajah se ye kabhi kabhi 401 error de sakta hai
 // (ACCESS_TOKEN_TYPE_UNSUPPORTED) — ye Google ki taraf ka masla hai, code ka nahi.
-async function askGemini(question) {
+async function askGemini(env, question) {
+  const { GEMINI_API_KEY, GEMINI_MODEL } = getConfig(env);
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
   const body = {
@@ -192,6 +209,7 @@ export default {
 
     // Debug route: seedha test karta hai token sahi hai ya nahi
     if (url.pathname === "/debug") {
+      const { BOT_TOKEN, GEMINI_API_KEY, GEMINI_MODEL } = getConfig(env);
       let telegramCheck = "not tested";
       try {
         const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getMe`);
@@ -233,6 +251,7 @@ export default {
 
     // Ek baar visit karke webhook set karne ke liye (deploy ke baad browser me kholein)
     if (url.pathname === "/setWebhook") {
+      const { BOT_TOKEN } = getConfig(env);
       const webhookUrl = `${url.origin}/webhook`;
       const res = await fetch(
         `https://api.telegram.org/bot${BOT_TOKEN}/setWebhook?url=${encodeURIComponent(
@@ -264,7 +283,7 @@ export default {
 
       // Agar photo/image bheji hai to seedha fixed reply do, Gemini ko mat bhejo
       if (message.photo || message.document) {
-        ctx.waitUntil(sendMessage(chatId, PHOTO_REPLY));
+        ctx.waitUntil(sendMessage(env, chatId, PHOTO_REPLY));
         return new Response("ok");
       }
 
@@ -286,7 +305,7 @@ export default {
 async function handleMessage(env, chatId, userId, text) {
   try {
     if (text === "/start") {
-      await sendMessage(chatId, START_REPLY);
+      await sendMessage(env, chatId, START_REPLY);
       return;
     }
 
@@ -295,17 +314,18 @@ async function handleMessage(env, chatId, userId, text) {
     if (!rateCheck.allowed) {
       const resetTimeStr = formatResetTime(rateCheck.resetTime);
       await sendMessage(
+        env,
         chatId,
         `आप मुझसे एक घंटे में केवल 15 सवाल पूछ सकते हैं, अभी आपकी सीमा समाप्त हो चुकी है। कृपया ${resetTimeStr} के बाद पुनः प्रयास करें।`
       );
       return;
     }
 
-    const answer = await askGeminiWithTyping(chatId, text);
-    await sendMessage(chatId, answer);
+    const answer = await askGeminiWithTyping(env, chatId, text);
+    await sendMessage(env, chatId, answer);
   } catch (err) {
     try {
-      await sendMessage(chatId, `DEBUG HANDLE ERROR: ${err.message}`);
+      await sendMessage(env, chatId, `DEBUG HANDLE ERROR: ${err.message}`);
     } catch (e) {
       // agar ye bhi fail ho jaye to kuch nahi ho sakta
     }
