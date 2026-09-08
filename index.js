@@ -5,7 +5,7 @@
 // =========================================================
 
 const BOT_TOKEN = "8961031495:AAEZncwlq5ZHKTDOwuO8rjRlGn1VkLDf-0g";
-const OPENROUTER_API_KEY = "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";
+const OPENROUTER_API_KEY = "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";
 const OPENROUTER_MODEL = "google/gemma-4-26b-a4b-it:free";
 
 const RATE_LIMIT_COUNT = 15;
