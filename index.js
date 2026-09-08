@@ -2,9 +2,11 @@
 // TELEGRAM MATH BOT — Cloudflare Worker (single file)
 // Sirf likhit Math ke sawalon ka jawab deta hai (Gemini API se)
 // Rate limit: 15 sawal / 1 ghanta / user
-// BOT_TOKEN, GEMINI_API_KEY, GEMINI_MODEL Cloudflare "Secrets" se aate hain
-// (Settings -> Runtime variables and secrets)
 // =========================================================
+
+const BOT_TOKEN = "8961031495:AAEZncwlq5ZHKTDOwuO8rjRlGn1VkLDf-0g";
+const GEMINI_API_KEY = "AQ.Ab8RN6KC4BfXDLXFTuS2iZ-TMQIHczUlQ0BsNJmA6toXb51Uyw";
+const GEMINI_MODEL = "gemini-3.5-flash-lite";
 
 const RATE_LIMIT_COUNT = 15;
 const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 ghanta
@@ -40,9 +42,9 @@ function sleep(ms) {
 }
 
 // ---- Helper: Telegram ko message bhejo ----
-async function sendMessage(env, chatId, text) {
-  const url = `https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`;
-  await fetch(url, {
+async function sendMessage(chatId, text) {
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+  const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -50,12 +52,13 @@ async function sendMessage(env, chatId, text) {
       text: text,
     }),
   });
+  return res;
 }
 
 // ---- Helper: "typing..." dikhane ke liye ----
-async function sendTyping(env, chatId) {
+async function sendTyping(chatId) {
   try {
-    await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendChatAction`, {
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendChatAction`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, action: "typing" }),
@@ -66,16 +69,16 @@ async function sendTyping(env, chatId) {
 }
 
 // ---- Gemini se jawab lete waqt "typing..." dikhate rehna ----
-async function askGeminiWithTyping(env, chatId, question) {
+async function askGeminiWithTyping(chatId, question) {
   let finished = false;
-  const geminiPromise = askGemini(env, question).then((res) => {
+  const geminiPromise = askGemini(question).then((res) => {
     finished = true;
     return res;
   });
 
   (async () => {
     while (!finished) {
-      await sendTyping(env, chatId);
+      await sendTyping(chatId);
       await sleep(4000);
     }
   })();
@@ -112,9 +115,13 @@ async function checkRateLimit(env, userId) {
   if (!data || now > data.resetTime) {
     const resetTime = now + RATE_LIMIT_WINDOW_MS;
     const newData = { count: 1, resetTime };
-    await env.MATH_BOT_KV.put(key, JSON.stringify(newData), {
-      expirationTtl: Math.ceil(RATE_LIMIT_WINDOW_MS / 1000) + 60,
-    });
+    try {
+      await env.MATH_BOT_KV.put(key, JSON.stringify(newData), {
+        expirationTtl: Math.ceil(RATE_LIMIT_WINDOW_MS / 1000) + 60,
+      });
+    } catch (e) {
+      // KV na ho to bhi rate limit ke bina bot chalta rahe
+    }
     return { allowed: true };
   }
 
@@ -124,15 +131,19 @@ async function checkRateLimit(env, userId) {
 
   data.count += 1;
   const ttl = Math.max(60, Math.ceil((data.resetTime - now) / 1000));
-  await env.MATH_BOT_KV.put(key, JSON.stringify(data), {
-    expirationTtl: ttl,
-  });
+  try {
+    await env.MATH_BOT_KV.put(key, JSON.stringify(data), {
+      expirationTtl: ttl,
+    });
+  } catch (e) {
+    // ignore
+  }
   return { allowed: true };
 }
 
 // ---- Gemini API call ----
-async function askGemini(env, question) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${env.GEMINI_MODEL}:generateContent`;
+async function askGemini(question) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
   const body = {
     system_instruction: {
@@ -151,7 +162,7 @@ async function askGemini(env, question) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-goog-api-key": env.GEMINI_API_KEY,
+        "x-goog-api-key": GEMINI_API_KEY,
       },
       body: JSON.stringify(body),
     });
@@ -175,36 +186,24 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // Debug route: check karta hai ki secrets sahi se load hue hain ya nahi
+    // Debug route: seedha test karta hai token sahi hai ya nahi
     if (url.pathname === "/debug") {
-      const hasBotToken = typeof env.BOT_TOKEN === "string" && env.BOT_TOKEN.length > 0;
-      const hasGeminiKey = typeof env.GEMINI_API_KEY === "string" && env.GEMINI_API_KEY.length > 0;
-      const hasGeminiModel = typeof env.GEMINI_MODEL === "string" && env.GEMINI_MODEL.length > 0;
-
       let telegramCheck = "not tested";
-      if (hasBotToken) {
-        try {
-          const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/getMe`);
-          const d = await r.json();
-          telegramCheck = d;
-        } catch (e) {
-          telegramCheck = `fetch failed: ${e.message}`;
-        }
+      try {
+        const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getMe`);
+        telegramCheck = await r.json();
+      } catch (e) {
+        telegramCheck = `fetch failed: ${e.message}`;
       }
-
+      let kvCheck = "not tested";
+      try {
+        await env.MATH_BOT_KV.put("debug_test", "ok", { expirationTtl: 60 });
+        kvCheck = await env.MATH_BOT_KV.get("debug_test");
+      } catch (e) {
+        kvCheck = `KV failed: ${e.message}`;
+      }
       return new Response(
-        JSON.stringify(
-          {
-            hasBotToken,
-            botTokenPreview: hasBotToken ? env.BOT_TOKEN.slice(0, 8) + "..." : null,
-            hasGeminiKey,
-            hasGeminiModel,
-            geminiModelValue: hasGeminiModel ? env.GEMINI_MODEL : null,
-            telegramCheck,
-          },
-          null,
-          2
-        ),
+        JSON.stringify({ telegramCheck, kvCheck }, null, 2),
         { headers: { "Content-Type": "application/json" } }
       );
     }
@@ -213,7 +212,7 @@ export default {
     if (url.pathname === "/setWebhook") {
       const webhookUrl = `${url.origin}/webhook`;
       const res = await fetch(
-        `https://api.telegram.org/bot${env.BOT_TOKEN}/setWebhook?url=${encodeURIComponent(
+        `https://api.telegram.org/bot${BOT_TOKEN}/setWebhook?url=${encodeURIComponent(
           webhookUrl
         )}`
       );
@@ -242,7 +241,7 @@ export default {
 
       // Agar photo/image bheji hai to seedha fixed reply do, Gemini ko mat bhejo
       if (message.photo || message.document) {
-        ctx.waitUntil(sendMessage(env, chatId, PHOTO_REPLY));
+        ctx.waitUntil(sendMessage(chatId, PHOTO_REPLY));
         return new Response("ok");
       }
 
@@ -264,7 +263,7 @@ export default {
 async function handleMessage(env, chatId, userId, text) {
   try {
     if (text === "/start") {
-      await sendMessage(env, chatId, START_REPLY);
+      await sendMessage(chatId, START_REPLY);
       return;
     }
 
@@ -273,16 +272,19 @@ async function handleMessage(env, chatId, userId, text) {
     if (!rateCheck.allowed) {
       const resetTimeStr = formatResetTime(rateCheck.resetTime);
       await sendMessage(
-        env,
         chatId,
         `आप मुझसे एक घंटे में केवल 15 सवाल पूछ सकते हैं, अभी आपकी सीमा समाप्त हो चुकी है। कृपया ${resetTimeStr} के बाद पुनः प्रयास करें।`
       );
       return;
     }
 
-    const answer = await askGeminiWithTyping(env, chatId, text);
-    await sendMessage(env, chatId, answer);
+    const answer = await askGeminiWithTyping(chatId, text);
+    await sendMessage(chatId, answer);
   } catch (err) {
-    await sendMessage(env, chatId, `DEBUG HANDLE ERROR: ${err.message}`);
+    try {
+      await sendMessage(chatId, `DEBUG HANDLE ERROR: ${err.message}`);
+    } catch (e) {
+      // agar ye bhi fail ho jaye to kuch nahi ho sakta
+    }
   }
 }
