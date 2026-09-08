@@ -1,0 +1,7 @@
+name = "telegram-math-bot"
+main = "index.js"
+compatibility_date = "2024-09-01"
+
+[[kv_namespaces]]
+binding = "MATH_BOT_KV"
+id = "5c84e6fcca79410b869162d9606057e8"
