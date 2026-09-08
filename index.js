@@ -175,6 +175,40 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    // Debug route: check karta hai ki secrets sahi se load hue hain ya nahi
+    if (url.pathname === "/debug") {
+      const hasBotToken = typeof env.BOT_TOKEN === "string" && env.BOT_TOKEN.length > 0;
+      const hasGeminiKey = typeof env.GEMINI_API_KEY === "string" && env.GEMINI_API_KEY.length > 0;
+      const hasGeminiModel = typeof env.GEMINI_MODEL === "string" && env.GEMINI_MODEL.length > 0;
+
+      let telegramCheck = "not tested";
+      if (hasBotToken) {
+        try {
+          const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/getMe`);
+          const d = await r.json();
+          telegramCheck = d;
+        } catch (e) {
+          telegramCheck = `fetch failed: ${e.message}`;
+        }
+      }
+
+      return new Response(
+        JSON.stringify(
+          {
+            hasBotToken,
+            botTokenPreview: hasBotToken ? env.BOT_TOKEN.slice(0, 8) + "..." : null,
+            hasGeminiKey,
+            hasGeminiModel,
+            geminiModelValue: hasGeminiModel ? env.GEMINI_MODEL : null,
+            telegramCheck,
+          },
+          null,
+          2
+        ),
+        { headers: { "Content-Type": "application/json" } }
+      );
+    }
+
     // Ek baar visit karke webhook set karne ke liye (deploy ke baad browser me kholein)
     if (url.pathname === "/setWebhook") {
       const webhookUrl = `${url.origin}/webhook`;
