@@ -1,12 +1,14 @@
 // =========================================================
 // TELEGRAM MATH BOT — Cloudflare Worker (single file)
+// GEMINI API VERSION
 // Sirf likhit Math ke sawalon ka jawab deta hai (Gemini API se)
 // Rate limit: 15 sawal / 1 ghanta / user
 // =========================================================
 
+// ⚠️ Neeche teeno values khud bharein:
 const BOT_TOKEN = "8961031495:AAEZncwlq5ZHKTDOwuO8rjRlGn1VkLDf-0g";
-const OPENROUTER_API_KEY = "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";
-const OPENROUTER_MODEL = "google/gemma-4-31b-it:free";
+const GEMINI_API_KEY = "AQ.Ab8RN6Km5c0UPCaJ0cXW-WjDw_-Kq9nxIZrRYoscwRyUZKYiUA";
+const GEMINI_MODEL = "gemini-3.5-flash-lite"; // jaise gemini-2.5-flash
 
 const RATE_LIMIT_COUNT = 15;
 const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 ghanta
@@ -44,7 +46,7 @@ function sleep(ms) {
 // ---- Helper: Telegram ko message bhejo ----
 async function sendMessage(chatId, text) {
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-  const res = await fetch(url, {
+  await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -52,7 +54,6 @@ async function sendMessage(chatId, text) {
       text: text,
     }),
   });
-  return res;
 }
 
 // ---- Helper: "typing..." dikhane ke liye ----
@@ -141,15 +142,22 @@ async function checkRateLimit(env, userId) {
   return { allowed: true };
 }
 
-// ---- OpenRouter API call ----
+// ---- Gemini API call ----
+// NOTE: Agar aapki key "AQ." se shuru hoti hai (naya Google "Auth key" format),
+// to Google ke server-side bug ki wajah se ye kabhi kabhi 401 error de sakta hai
+// (ACCESS_TOKEN_TYPE_UNSUPPORTED) — ye Google ki taraf ka masla hai, code ka nahi.
 async function askGemini(question) {
-  const url = `https://openrouter.ai/api/v1/chat/completions`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
   const body = {
-    model: OPENROUTER_MODEL,
-    messages: [
-      { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: question },
+    system_instruction: {
+      parts: [{ text: SYSTEM_PROMPT }],
+    },
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: question }],
+      },
     ],
   };
 
@@ -158,7 +166,7 @@ async function askGemini(question) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+        "Authorization": `Bearer ${GEMINI_API_KEY}`,
       },
       body: JSON.stringify(body),
     });
@@ -170,7 +178,7 @@ async function askGemini(question) {
       return `DEBUG ERROR (status ${res.status}): ${JSON.stringify(data)}`;
     }
 
-    const text = data?.choices?.[0]?.message?.content;
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
     return text ? text.trim() : GENERIC_ERROR_REPLY;
   } catch (err) {
     return `DEBUG FETCH ERROR: ${err.message}`;
@@ -198,25 +206,27 @@ export default {
       } catch (e) {
         kvCheck = `KV failed: ${e.message}`;
       }
-      let openRouterCheck = "not tested";
+      let geminiCheck = "not tested";
       try {
-        const r2 = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
-          },
-          body: JSON.stringify({
-            model: OPENROUTER_MODEL,
-            messages: [{ role: "user", content: "2+2 kitna hota hai, ek shabd me jawab do" }],
-          }),
-        });
-        openRouterCheck = await r2.json();
+        const r2 = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${GEMINI_API_KEY}`,
+            },
+            body: JSON.stringify({
+              contents: [{ role: "user", parts: [{ text: "2+2 kitna hota hai, ek shabd me jawab do" }] }],
+            }),
+          }
+        );
+        geminiCheck = await r2.json();
       } catch (e) {
-        openRouterCheck = `fetch failed: ${e.message}`;
+        geminiCheck = `fetch failed: ${e.message}`;
       }
       return new Response(
-        JSON.stringify({ telegramCheck, kvCheck, openRouterCheck }, null, 2),
+        JSON.stringify({ telegramCheck, kvCheck, geminiCheck }, null, 2),
         { headers: { "Content-Type": "application/json" } }
       );
     }
