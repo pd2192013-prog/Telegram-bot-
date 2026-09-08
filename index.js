@@ -6,7 +6,7 @@
 
 // ---- CONFIG ----
 // ⚠️ GEMINI_API_KEY yahan asli Gemini API key honi chahiye (AIzaSy... se shuru hoti hai).
-const BOT_TOKEN = "8934885021:AAHOig55eA6B4V38EurEdCeM9PSeAhh9Qcs";
+const BOT_TOKEN = "8961031495:AAHIb_LcAREim_2g0-FlbXGv1LU866o_T4w";
 const GEMINI_API_KEY = "AQ.Ab8RN6J99s8hsukqLZzBjrh_pYfSlqYaRagSni1x3Y39QAajHQ";
 const GEMINI_MODEL = "gemini-3.5-flash-lite";
 
