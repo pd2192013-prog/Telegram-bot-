@@ -1,19 +1,19 @@
 // =========================================================
 // TELEGRAM MATH BOT — Cloudflare Worker (single file)
-// XKIRO API + ADMIN PANEL + TELEGRAM STARS PAYMENTS
+// GROQ API + ADMIN PANEL + TELEGRAM STARS PAYMENTS
 // =========================================================
 
 const BOT_TOKEN_FALLBACK = "YAHAN_APNA_TELEGRAM_BOT_TOKEN_DALEIN";
-const XKIRO_API_KEY_FALLBACK = "YAHAN_APNI_XKIRO_API_KEY_DALEIN";
-const XKIRO_MODEL_FALLBACK = "openai/gpt-4o";
+const GROQ_API_KEY_FALLBACK = "YAHAN_APNI_GROQ_API_KEY_DALEIN";
+const GROQ_MODEL_FALLBACK = "meta-llama/llama-4-scout-17b-16e-instruct";
 const ADMIN_ID_FALLBACK = "admin";
 const ADMIN_PASSWORD_FALLBACK = "change_this_password";
 
 function getConfig(env) {
   return {
     BOT_TOKEN: (env && env.BOT_TOKEN) || BOT_TOKEN_FALLBACK,
-    XKIRO_API_KEY: (env && env.XKIRO_API_KEY) || XKIRO_API_KEY_FALLBACK,
-    XKIRO_MODEL: (env && env.XKIRO_MODEL) || XKIRO_MODEL_FALLBACK,
+    GROQ_API_KEY: (env && env.GROQ_API_KEY) || GROQ_API_KEY_FALLBACK,
+    GROQ_MODEL: (env && env.GROQ_MODEL) || GROQ_MODEL_FALLBACK,
     ADMIN_ID: (env && env.ADMIN_ID) || ADMIN_ID_FALLBACK,
     ADMIN_PASSWORD: (env && env.ADMIN_PASSWORD) || ADMIN_PASSWORD_FALLBACK,
   };
@@ -95,9 +95,9 @@ async function sendTyping(env, chatId) {
   }
 }
 
-async function askXkiroWithTyping(env, chatId, question) {
+async function askGroqWithTyping(env, chatId, question) {
   let finished = false;
-  const p = askXkiro(env, question).then((res) => { finished = true; return res; });
+  const p = askGroq(env, question).then((res) => { finished = true; return res; });
   (async () => {
     while (!finished) {
       await sendTyping(env, chatId);
@@ -107,9 +107,9 @@ async function askXkiroWithTyping(env, chatId, question) {
   return p;
 }
 
-async function askXkiroImageWithTyping(env, chatId, base64Image, caption) {
+async function askGroqImageWithTyping(env, chatId, base64Image, caption) {
   let finished = false;
-  const p = askXkiroImage(env, base64Image, caption).then((res) => { finished = true; return res; });
+  const p = askGroqImage(env, base64Image, caption).then((res) => { finished = true; return res; });
   (async () => {
     while (!finished) {
       await sendTyping(env, chatId);
@@ -152,7 +152,7 @@ async function getEffectiveModel(env) {
     const m = await env.MATH_BOT_KV.get("cfg:model");
     if (m) return m;
   } catch (e) {}
-  return getConfig(env).XKIRO_MODEL;
+  return getConfig(env).GROQ_MODEL;
 }
 
 async function getEffectiveRateLimit(env) {
@@ -450,58 +450,79 @@ async function getTotalStars(env) {
 }
 
 // =========================================================
-// XKIRO API CALLS
+// GROQ API CALLS
 // =========================================================
-async function askXkiro(env, question) {
-  const { XKIRO_API_KEY } = getConfig(env);
-  const XKIRO_MODEL = await getEffectiveModel(env);
-  try {
-    const res = await fetch("https://api.xkiro.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${XKIRO_API_KEY}` },
-      body: JSON.stringify({
-        model: XKIRO_MODEL,
-        messages: [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: question }],
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) return `DEBUG ERROR (status ${res.status}): ${JSON.stringify(data)}`;
-    const text = data?.choices?.[0]?.message?.content;
-    return text ? text.trim() : GENERIC_ERROR_REPLY;
-  } catch (err) {
-    return `DEBUG FETCH ERROR: ${err.message}`;
+const GROQ_RETRYABLE_STATUS = [429, 500, 502, 503, 504];
+const GROQ_MAX_ATTEMPTS = 3;
+
+// GROQ server kabhi-kabhi transient 5xx/429 deta hai — ise chhoti si backoff ke saath retry karo
+async function callGroqWithRetry(env, body) {
+  const { GROQ_API_KEY } = getConfig(env);
+  let lastStatus = null, lastData = null, lastErr = null;
+
+  for (let attempt = 1; attempt <= GROQ_MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${GROQ_API_KEY}` },
+        body: JSON.stringify(body),
+      });
+      let data;
+      try {
+        data = await res.json();
+      } catch (e) {
+        data = null;
+      }
+      if (res.ok) {
+        return { ok: true, data };
+      }
+      lastStatus = res.status;
+      lastData = data;
+      if (!GROQ_RETRYABLE_STATUS.includes(res.status) || attempt === GROQ_MAX_ATTEMPTS) {
+        break;
+      }
+    } catch (err) {
+      lastErr = err;
+      if (attempt === GROQ_MAX_ATTEMPTS) break;
+    }
+    await sleep(500 * attempt); // 500ms, 1000ms backoff
   }
+
+  console.error("GROQ call failed", { lastStatus, lastData, lastErr: lastErr && lastErr.message });
+  return { ok: false, status: lastStatus, data: lastData, err: lastErr };
 }
 
-async function askXkiroImage(env, base64Image, caption) {
-  const { XKIRO_API_KEY } = getConfig(env);
-  const XKIRO_MODEL = await getEffectiveModel(env);
-  try {
-    const res = await fetch("https://api.xkiro.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${XKIRO_API_KEY}` },
-      body: JSON.stringify({
-        model: XKIRO_MODEL,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          {
-            role: "user",
-            content: [
-              { type: "text", text: caption || "इस फोटो में दिए गणित के सवाल को हल करो।" },
-              { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } },
-            ],
-          },
-        ],
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) return `DEBUG ERROR (status ${res.status}): ${JSON.stringify(data)}`;
-    const text = data?.choices?.[0]?.message?.content;
-    return text ? text.trim() : GENERIC_ERROR_REPLY;
-  } catch (err) {
-    return `DEBUG FETCH ERROR: ${err.message}`;
-  }
+async function askGroq(env, question) {
+  const GROQ_MODEL = await getEffectiveModel(env);
+  const result = await callGroqWithRetry(env, {
+    model: GROQ_MODEL,
+    messages: [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: question }],
+  });
+  if (!result.ok) return GENERIC_ERROR_REPLY;
+  const text = result.data?.choices?.[0]?.message?.content;
+  return text ? text.trim() : GENERIC_ERROR_REPLY;
 }
+
+async function askGroqImage(env, base64Image, caption) {
+  const GROQ_MODEL = await getEffectiveModel(env);
+  const result = await callGroqWithRetry(env, {
+    model: GROQ_MODEL,
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: caption || "इस फोटो में दिए गणित के सवाल को हल करो।" },
+          { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } },
+        ],
+      },
+    ],
+  });
+  if (!result.ok) return GENERIC_ERROR_REPLY;
+  const text = result.data?.choices?.[0]?.message?.content;
+  return text ? text.trim() : GENERIC_ERROR_REPLY;
+}
+
 
 // ---- Telegram se photo ka file base64 me download karna ----
 async function getTelegramFileAsBase64(env, fileId) {
@@ -562,7 +583,42 @@ async function handleSuccessfulPayment(env, chatId, userId, successfulPayment) {
 // =========================================================
 // ADMIN AUTH
 // =========================================================
-function isAdminAuthorized(request, env) {
+const ADMIN_SESSION_TTL_SECONDS = 30 * 60; // 30 minutes
+
+function genAdminToken() {
+  return crypto.randomUUID().replace(/-/g, "");
+}
+
+// Bot me admin password bhejne par ek token session banta hai (KV me, TTL ke saath)
+async function createAdminSession(env, telegramId) {
+  const token = genAdminToken();
+  try {
+    await env.MATH_BOT_KV.put(
+      `adminsession:${token}`,
+      JSON.stringify({ telegramId: String(telegramId), createdAt: Date.now() }),
+      { expirationTtl: ADMIN_SESSION_TTL_SECONDS }
+    );
+  } catch (e) {
+    return null;
+  }
+  return token;
+}
+
+async function isValidAdminToken(env, token) {
+  if (!token) return false;
+  try {
+    const raw = await env.MATH_BOT_KV.get(`adminsession:${token}`);
+    return Boolean(raw);
+  } catch (e) {
+    return false;
+  }
+}
+
+async function isAdminAuthorized(request, env) {
+  const token = request.headers.get("x-admin-token");
+  if (token) {
+    return await isValidAdminToken(env, token);
+  }
   const { ADMIN_ID, ADMIN_PASSWORD } = getConfig(env);
   const id = request.headers.get("x-admin-id") || "";
   const pass = request.headers.get("x-admin-password") || "";
@@ -639,7 +695,7 @@ const ADMIN_PAGE_HTML = `<!DOCTYPE html>
     <h2>⚙️ Global Config</h2>
     <div class="row">
       <label>Model:</label>
-      <input id="cfgModel" placeholder="jaise openai/gpt-4o" style="width:220px">
+      <input id="cfgModel" placeholder="jaise meta-llama/llama-4-scout-17b-16e-instruct" style="width:220px">
     </div>
     <div class="row">
       <label>Free limit:</label>
@@ -768,12 +824,31 @@ const ADMIN_PAGE_HTML = `<!DOCTYPE html>
 
 <script>
 let creds = null;
+let sessionToken = null;
 let allUsers = [];
 let allPlans = [];
 let editingPlanId = null;
 
 function authHeaders() {
+  if (sessionToken) {
+    return { "Content-Type": "application/json", "X-Admin-Token": sessionToken };
+  }
   return { "Content-Type": "application/json", "X-Admin-Id": creds.id, "X-Admin-Password": creds.pass };
+}
+
+async function doLoginWithToken(token) {
+  sessionToken = token;
+  const r = await fetch('/admin/api/stats', { headers: authHeaders() });
+  if (r.status === 200) {
+    localStorage.setItem('mb_admin_token', token);
+    document.getElementById('loginBox').style.display = 'none';
+    document.getElementById('dash').style.display = 'block';
+    loadAll();
+    return true;
+  }
+  sessionToken = null;
+  localStorage.removeItem('mb_admin_token');
+  return false;
 }
 
 async function doLogin() {
@@ -795,7 +870,9 @@ async function doLogin() {
 function logout() {
   localStorage.removeItem('mb_admin_id');
   localStorage.removeItem('mb_admin_pass');
+  localStorage.removeItem('mb_admin_token');
   creds = null;
+  sessionToken = null;
   document.getElementById('dash').style.display = 'none';
   document.getElementById('loginBox').style.display = 'block';
 }
@@ -1067,7 +1144,20 @@ async function loadPayments() {
   });
 }
 
-(function init() {
+(async function init() {
+  const urlToken = __ADMIN_URL_TOKEN__;
+  if (urlToken) {
+    // URL se token hata do taaki wo history/address bar me na reh jaaye
+    const cleanUrl = window.location.origin + window.location.pathname;
+    window.history.replaceState({}, document.title, cleanUrl);
+    const ok = await doLoginWithToken(urlToken);
+    if (ok) return;
+  }
+  const savedToken = localStorage.getItem('mb_admin_token');
+  if (savedToken) {
+    const ok = await doLoginWithToken(savedToken);
+    if (ok) return;
+  }
   const id = localStorage.getItem('mb_admin_id');
   const pass = localStorage.getItem('mb_admin_pass');
   if (id && pass) {
@@ -1085,7 +1175,7 @@ async function loadPayments() {
 // =========================================================
 async function handleAdminApi(request, env, url) {
   const pathname = url.pathname;
-  if (!isAdminAuthorized(request, env)) {
+  if (!(await isAdminAuthorized(request, env))) {
     return jsonResponse({ error: "Unauthorized" }, 401);
   }
 
@@ -1259,7 +1349,12 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/admin" && request.method === "GET") {
-      return new Response(ADMIN_PAGE_HTML, { headers: { "Content-Type": "text/html; charset=UTF-8" } });
+      const tokenFromUrl = url.searchParams.get("token") || "";
+      const page = ADMIN_PAGE_HTML.replace(
+        "__ADMIN_URL_TOKEN__",
+        JSON.stringify(tokenFromUrl)
+      );
+      return new Response(page, { headers: { "Content-Type": "text/html; charset=UTF-8" } });
     }
 
     if (url.pathname.startsWith("/admin/api/")) {
@@ -1267,8 +1362,8 @@ export default {
     }
 
     if (url.pathname === "/debug") {
-      const { BOT_TOKEN, XKIRO_API_KEY } = getConfig(env);
-      const XKIRO_MODEL = await getEffectiveModel(env);
+      const { BOT_TOKEN, GROQ_API_KEY } = getConfig(env);
+      const GROQ_MODEL = await getEffectiveModel(env);
       let telegramCheck = "not tested";
       try {
         const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getMe`);
@@ -1279,16 +1374,16 @@ export default {
         await env.MATH_BOT_KV.put("debug_test", "ok", { expirationTtl: 60 });
         kvCheck = await env.MATH_BOT_KV.get("debug_test");
       } catch (e) { kvCheck = `KV failed: ${e.message}`; }
-      let xkiroCheck = "not tested";
+      let groqCheck = "not tested";
       try {
-        const r2 = await fetch("https://api.xkiro.com/v1/chat/completions", {
+        const r2 = await fetch("https://api.groq.com/openai/v1/chat/completions", {
           method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${XKIRO_API_KEY}` },
-          body: JSON.stringify({ model: XKIRO_MODEL, messages: [{ role: "user", content: "2+2 kitna hota hai, ek shabd me jawab do" }] }),
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${GROQ_API_KEY}` },
+          body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: "user", content: "2+2 kitna hota hai, ek shabd me jawab do" }] }),
         });
-        xkiroCheck = await r2.json();
-      } catch (e) { xkiroCheck = `fetch failed: ${e.message}`; }
-      return new Response(JSON.stringify({ telegramCheck, kvCheck, xkiroCheck, model: XKIRO_MODEL }, null, 2), { headers: { "Content-Type": "application/json" } });
+        groqCheck = await r2.json();
+      } catch (e) { groqCheck = `fetch failed: ${e.message}`; }
+      return new Response(JSON.stringify({ telegramCheck, kvCheck, groqCheck, model: GROQ_MODEL }, null, 2), { headers: { "Content-Type": "application/json" } });
     }
 
     if (url.pathname === "/setWebhook") {
@@ -1358,7 +1453,7 @@ export default {
       }
 
       const text = message.text.trim();
-      ctx.waitUntil(handleMessage(env, chatId, userId, text, from));
+      ctx.waitUntil(handleMessage(env, chatId, userId, text, from, url.origin));
 
       return new Response("ok");
     }
@@ -1412,7 +1507,7 @@ async function handlePhotoMessage(env, chatId, userId, message, from) {
     const best = photos[photos.length - 1]; // sabse bada size
     const base64 = await getTelegramFileAsBase64(env, best.file_id);
     const caption = message.caption || "";
-    const answer = await askXkiroImageWithTyping(env, chatId, base64, caption);
+    const answer = await askGroqImageWithTyping(env, chatId, base64, caption);
     await sendMessage(env, chatId, answer);
     await appendChatLog(env, userId, "[फोटो सवाल] " + caption, answer);
   } catch (err) {
@@ -1423,8 +1518,26 @@ async function handlePhotoMessage(env, chatId, userId, message, from) {
 }
 
 // ---- Message handling logic (text) ----
-async function handleMessage(env, chatId, userId, text, from) {
+async function handleMessage(env, chatId, userId, text, from, origin) {
   try {
+    // ---- Admin: agar real admin Telegram ID se apna password bheja gaya hai, to panel seedha button se khulega ----
+    const { ADMIN_ID, ADMIN_PASSWORD } = getConfig(env);
+    if (ADMIN_ID && ADMIN_PASSWORD && String(userId) === String(ADMIN_ID) && text === ADMIN_PASSWORD) {
+      const token = await createAdminSession(env, userId);
+      if (token && origin) {
+        await sendMessage(env, chatId, "✅ Pehchaan gaya, aap admin hain.", {
+          reply_markup: {
+            inline_keyboard: [[
+              { text: "🔓 Admin Panel Kholein", web_app: { url: `${origin}/admin?token=${token}` } },
+            ]],
+          },
+        });
+      } else {
+        await sendMessage(env, chatId, "Admin session banane me samasya aayi, dobara try karein.");
+      }
+      return;
+    }
+
     if (text === "/start") {
       const { count, windowMs } = await getEffectiveRateLimit(env);
       const template = await getEffectiveStartMessage(env);
@@ -1450,7 +1563,7 @@ async function handleMessage(env, chatId, userId, text, from) {
       return;
     }
 
-    const answer = await askXkiroWithTyping(env, chatId, text);
+    const answer = await askGroqWithTyping(env, chatId, text);
     await sendMessage(env, chatId, answer);
     await appendChatLog(env, userId, text, answer);
   } catch (err) {
