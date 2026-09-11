@@ -452,56 +452,77 @@ async function getTotalStars(env) {
 // =========================================================
 // XKIRO API CALLS
 // =========================================================
-async function askXkiro(env, question) {
+const XKIRO_RETRYABLE_STATUS = [429, 500, 502, 503, 504];
+const XKIRO_MAX_ATTEMPTS = 3;
+
+// XKIRO server kabhi-kabhi transient 5xx/429 deta hai — ise chhoti si backoff ke saath retry karo
+async function callXkiroWithRetry(env, body) {
   const { XKIRO_API_KEY } = getConfig(env);
-  const XKIRO_MODEL = await getEffectiveModel(env);
-  try {
-    const res = await fetch("https://api.xkiro.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${XKIRO_API_KEY}` },
-      body: JSON.stringify({
-        model: XKIRO_MODEL,
-        messages: [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: question }],
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) return `DEBUG ERROR (status ${res.status}): ${JSON.stringify(data)}`;
-    const text = data?.choices?.[0]?.message?.content;
-    return text ? text.trim() : GENERIC_ERROR_REPLY;
-  } catch (err) {
-    return `DEBUG FETCH ERROR: ${err.message}`;
+  let lastStatus = null, lastData = null, lastErr = null;
+
+  for (let attempt = 1; attempt <= XKIRO_MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch("https://api.xkiro.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${XKIRO_API_KEY}` },
+        body: JSON.stringify(body),
+      });
+      let data;
+      try {
+        data = await res.json();
+      } catch (e) {
+        data = null;
+      }
+      if (res.ok) {
+        return { ok: true, data };
+      }
+      lastStatus = res.status;
+      lastData = data;
+      if (!XKIRO_RETRYABLE_STATUS.includes(res.status) || attempt === XKIRO_MAX_ATTEMPTS) {
+        break;
+      }
+    } catch (err) {
+      lastErr = err;
+      if (attempt === XKIRO_MAX_ATTEMPTS) break;
+    }
+    await sleep(500 * attempt); // 500ms, 1000ms backoff
   }
+
+  console.error("XKIRO call failed", { lastStatus, lastData, lastErr: lastErr && lastErr.message });
+  return { ok: false, status: lastStatus, data: lastData, err: lastErr };
+}
+
+async function askXkiro(env, question) {
+  const XKIRO_MODEL = await getEffectiveModel(env);
+  const result = await callXkiroWithRetry(env, {
+    model: XKIRO_MODEL,
+    messages: [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: question }],
+  });
+  if (!result.ok) return GENERIC_ERROR_REPLY;
+  const text = result.data?.choices?.[0]?.message?.content;
+  return text ? text.trim() : GENERIC_ERROR_REPLY;
 }
 
 async function askXkiroImage(env, base64Image, caption) {
-  const { XKIRO_API_KEY } = getConfig(env);
   const XKIRO_MODEL = await getEffectiveModel(env);
-  try {
-    const res = await fetch("https://api.xkiro.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${XKIRO_API_KEY}` },
-      body: JSON.stringify({
-        model: XKIRO_MODEL,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          {
-            role: "user",
-            content: [
-              { type: "text", text: caption || "इस फोटो में दिए गणित के सवाल को हल करो।" },
-              { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } },
-            ],
-          },
+  const result = await callXkiroWithRetry(env, {
+    model: XKIRO_MODEL,
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: caption || "इस फोटो में दिए गणित के सवाल को हल करो।" },
+          { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } },
         ],
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) return `DEBUG ERROR (status ${res.status}): ${JSON.stringify(data)}`;
-    const text = data?.choices?.[0]?.message?.content;
-    return text ? text.trim() : GENERIC_ERROR_REPLY;
-  } catch (err) {
-    return `DEBUG FETCH ERROR: ${err.message}`;
-  }
+      },
+    ],
+  });
+  if (!result.ok) return GENERIC_ERROR_REPLY;
+  const text = result.data?.choices?.[0]?.message?.content;
+  return text ? text.trim() : GENERIC_ERROR_REPLY;
 }
+
 
 // ---- Telegram se photo ka file base64 me download karna ----
 async function getTelegramFileAsBase64(env, fileId) {
@@ -562,7 +583,42 @@ async function handleSuccessfulPayment(env, chatId, userId, successfulPayment) {
 // =========================================================
 // ADMIN AUTH
 // =========================================================
-function isAdminAuthorized(request, env) {
+const ADMIN_SESSION_TTL_SECONDS = 30 * 60; // 30 minutes
+
+function genAdminToken() {
+  return crypto.randomUUID().replace(/-/g, "");
+}
+
+// Bot me admin password bhejne par ek token session banta hai (KV me, TTL ke saath)
+async function createAdminSession(env, telegramId) {
+  const token = genAdminToken();
+  try {
+    await env.MATH_BOT_KV.put(
+      `adminsession:${token}`,
+      JSON.stringify({ telegramId: String(telegramId), createdAt: Date.now() }),
+      { expirationTtl: ADMIN_SESSION_TTL_SECONDS }
+    );
+  } catch (e) {
+    return null;
+  }
+  return token;
+}
+
+async function isValidAdminToken(env, token) {
+  if (!token) return false;
+  try {
+    const raw = await env.MATH_BOT_KV.get(`adminsession:${token}`);
+    return Boolean(raw);
+  } catch (e) {
+    return false;
+  }
+}
+
+async function isAdminAuthorized(request, env) {
+  const token = request.headers.get("x-admin-token");
+  if (token) {
+    return await isValidAdminToken(env, token);
+  }
   const { ADMIN_ID, ADMIN_PASSWORD } = getConfig(env);
   const id = request.headers.get("x-admin-id") || "";
   const pass = request.headers.get("x-admin-password") || "";
@@ -768,12 +824,31 @@ const ADMIN_PAGE_HTML = `<!DOCTYPE html>
 
 <script>
 let creds = null;
+let sessionToken = null;
 let allUsers = [];
 let allPlans = [];
 let editingPlanId = null;
 
 function authHeaders() {
+  if (sessionToken) {
+    return { "Content-Type": "application/json", "X-Admin-Token": sessionToken };
+  }
   return { "Content-Type": "application/json", "X-Admin-Id": creds.id, "X-Admin-Password": creds.pass };
+}
+
+async function doLoginWithToken(token) {
+  sessionToken = token;
+  const r = await fetch('/admin/api/stats', { headers: authHeaders() });
+  if (r.status === 200) {
+    localStorage.setItem('mb_admin_token', token);
+    document.getElementById('loginBox').style.display = 'none';
+    document.getElementById('dash').style.display = 'block';
+    loadAll();
+    return true;
+  }
+  sessionToken = null;
+  localStorage.removeItem('mb_admin_token');
+  return false;
 }
 
 async function doLogin() {
@@ -795,7 +870,9 @@ async function doLogin() {
 function logout() {
   localStorage.removeItem('mb_admin_id');
   localStorage.removeItem('mb_admin_pass');
+  localStorage.removeItem('mb_admin_token');
   creds = null;
+  sessionToken = null;
   document.getElementById('dash').style.display = 'none';
   document.getElementById('loginBox').style.display = 'block';
 }
@@ -1067,7 +1144,20 @@ async function loadPayments() {
   });
 }
 
-(function init() {
+(async function init() {
+  const urlToken = __ADMIN_URL_TOKEN__;
+  if (urlToken) {
+    // URL se token hata do taaki wo history/address bar me na reh jaaye
+    const cleanUrl = window.location.origin + window.location.pathname;
+    window.history.replaceState({}, document.title, cleanUrl);
+    const ok = await doLoginWithToken(urlToken);
+    if (ok) return;
+  }
+  const savedToken = localStorage.getItem('mb_admin_token');
+  if (savedToken) {
+    const ok = await doLoginWithToken(savedToken);
+    if (ok) return;
+  }
   const id = localStorage.getItem('mb_admin_id');
   const pass = localStorage.getItem('mb_admin_pass');
   if (id && pass) {
@@ -1085,7 +1175,7 @@ async function loadPayments() {
 // =========================================================
 async function handleAdminApi(request, env, url) {
   const pathname = url.pathname;
-  if (!isAdminAuthorized(request, env)) {
+  if (!(await isAdminAuthorized(request, env))) {
     return jsonResponse({ error: "Unauthorized" }, 401);
   }
 
@@ -1259,7 +1349,12 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/admin" && request.method === "GET") {
-      return new Response(ADMIN_PAGE_HTML, { headers: { "Content-Type": "text/html; charset=UTF-8" } });
+      const tokenFromUrl = url.searchParams.get("token") || "";
+      const page = ADMIN_PAGE_HTML.replace(
+        "__ADMIN_URL_TOKEN__",
+        JSON.stringify(tokenFromUrl)
+      );
+      return new Response(page, { headers: { "Content-Type": "text/html; charset=UTF-8" } });
     }
 
     if (url.pathname.startsWith("/admin/api/")) {
@@ -1358,7 +1453,7 @@ export default {
       }
 
       const text = message.text.trim();
-      ctx.waitUntil(handleMessage(env, chatId, userId, text, from));
+      ctx.waitUntil(handleMessage(env, chatId, userId, text, from, url.origin));
 
       return new Response("ok");
     }
@@ -1423,8 +1518,26 @@ async function handlePhotoMessage(env, chatId, userId, message, from) {
 }
 
 // ---- Message handling logic (text) ----
-async function handleMessage(env, chatId, userId, text, from) {
+async function handleMessage(env, chatId, userId, text, from, origin) {
   try {
+    // ---- Admin: agar real admin Telegram ID se apna password bheja gaya hai, to panel seedha button se khulega ----
+    const { ADMIN_ID, ADMIN_PASSWORD } = getConfig(env);
+    if (ADMIN_ID && ADMIN_PASSWORD && String(userId) === String(ADMIN_ID) && text === ADMIN_PASSWORD) {
+      const token = await createAdminSession(env, userId);
+      if (token && origin) {
+        await sendMessage(env, chatId, "✅ Pehchaan gaya, aap admin hain.", {
+          reply_markup: {
+            inline_keyboard: [[
+              { text: "🔓 Admin Panel Kholein", web_app: { url: `${origin}/admin?token=${token}` } },
+            ]],
+          },
+        });
+      } else {
+        await sendMessage(env, chatId, "Admin session banane me samasya aayi, dobara try karein.");
+      }
+      return;
+    }
+
     if (text === "/start") {
       const { count, windowMs } = await getEffectiveRateLimit(env);
       const template = await getEffectiveStartMessage(env);
