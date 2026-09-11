@@ -1,26 +1,26 @@
 // =========================================================
 // TELEGRAM MATH BOT — Cloudflare Worker (single file)
-// APINEX API VERSION
-// Sirf likhit Math ke sawalon ka jawab deta hai (APInex API se)
+// XKIRO API VERSION
+// Sirf likhit Math ke sawalon ka jawab deta hai (Xkiro API se)
 // Rate limit: 15 sawal / 1 ghanta / user
 // =========================================================
 
 // ⚠️ Ye teeno values ab seedha yahan likhne ki zaroorat nahi hai.
 // Cloudflare Worker ke Settings → Variables and Secrets me
-// BOT_TOKEN, APINEX_API_KEY aur APINEX_MODEL naam se secret add karein,
+// BOT_TOKEN, XKIRO_API_KEY aur XKIRO_MODEL naam se secret add karein,
 // code automatically wahi values use kar lega.
 // (Agar aap chahte hain to yahan neeche bhi bhar sakte hain — ye sirf
 // fallback hai, jab Cloudflare secret na mila ho tab hi use hoga.)
 const BOT_TOKEN_FALLBACK = "YAHAN_APNA_TELEGRAM_BOT_TOKEN_DALEIN";
-const APINEX_API_KEY_FALLBACK = "YAHAN_APNI_APINEX_API_KEY_DALEIN"; // jaise sk-apx...
-const APINEX_MODEL_FALLBACK = "YAHAN_APNA_MODEL_NAAM_DALEIN"; // jaise gpt/5.6-sol
+const XKIRO_API_KEY_FALLBACK = "YAHAN_APNI_XKIRO_API_KEY_DALEIN";
+const XKIRO_MODEL_FALLBACK = "openai/gpt-4o"; // ya koi aur valid Xkiro model
 
 // ---- Helper: env se ya fallback se config value lo ----
 function getConfig(env) {
   return {
     BOT_TOKEN: (env && env.BOT_TOKEN) || BOT_TOKEN_FALLBACK,
-    APINEX_API_KEY: (env && env.APINEX_API_KEY) || APINEX_API_KEY_FALLBACK,
-    APINEX_MODEL: (env && env.APINEX_MODEL) || APINEX_MODEL_FALLBACK,
+    XKIRO_API_KEY: (env && env.XKIRO_API_KEY) || XKIRO_API_KEY_FALLBACK,
+    XKIRO_MODEL: (env && env.XKIRO_MODEL) || XKIRO_MODEL_FALLBACK,
   };
 }
 
@@ -34,7 +34,7 @@ const START_REPLY =
   "नमस्ते! मुझसे केवल गणित के सवाल पूछिए, मैं चरण-दर-चरण हल बताऊँगा।\nआप एक घंटे में केवल 15 सवाल पूछ सकते हैं।";
 const GENERIC_ERROR_REPLY = "क्षमा कीजिए, अभी उत्तर तैयार करने में समस्या आई है। कृपया थोड़ी देर बाद पुनः प्रयास करें।";
 
-// ---- SYSTEM PROMPT for APInex (poori Hindi me) ----
+// ---- SYSTEM PROMPT for Xkiro (poori Hindi me) ----
 const SYSTEM_PROMPT = `तुम एक ऐसा सहायक हो जो केवल गणित (Mathematics) के सवालों के उत्तर देता है, बिल्कुल एक school ki NCERT/Reference textbook ke solution jaisa.
 
 नियम (इन सभी का सख्ती से पालन करो):
@@ -98,10 +98,10 @@ async function sendTyping(env, chatId) {
   }
 }
 
-// ---- APInex se jawab lete waqt "typing..." dikhate rehna ----
-async function askApinexWithTyping(env, chatId, question) {
+// ---- Xkiro se jawab lete waqt "typing..." dikhate rehna ----
+async function askXkiroWithTyping(env, chatId, question) {
   let finished = false;
-  const apinexPromise = askApinex(env, question).then((res) => {
+  const xkiroPromise = askXkiro(env, question).then((res) => {
     finished = true;
     return res;
   });
@@ -113,7 +113,7 @@ async function askApinexWithTyping(env, chatId, question) {
     }
   })();
 
-  return apinexPromise;
+  return xkiroPromise;
 }
 
 // ---- Helper: Time ko readable format me convert karo (IST) ----
@@ -171,13 +171,13 @@ async function checkRateLimit(env, userId) {
   return { allowed: true };
 }
 
-// ---- APInex API call ----
-async function askApinex(env, question) {
-  const { APINEX_API_KEY, APINEX_MODEL } = getConfig(env);
-  const url = "https://api.apinex.bond/v1/chat/completions";
+// ---- Xkiro API call ----
+async function askXkiro(env, question) {
+  const { XKIRO_API_KEY, XKIRO_MODEL } = getConfig(env);
+  const url = "https://api.xkiro.com/v1/chat/completions";
 
   const body = {
-    model: APINEX_MODEL,
+    model: XKIRO_MODEL,
     messages: [
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: question },
@@ -189,7 +189,7 @@ async function askApinex(env, question) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${APINEX_API_KEY}`,
+        "Authorization": `Bearer ${XKIRO_API_KEY}`,
       },
       body: JSON.stringify(body),
     });
@@ -215,7 +215,7 @@ export default {
 
     // Debug route: seedha test karta hai token sahi hai ya nahi
     if (url.pathname === "/debug") {
-      const { BOT_TOKEN, APINEX_API_KEY, APINEX_MODEL } = getConfig(env);
+      const { BOT_TOKEN, XKIRO_API_KEY, XKIRO_MODEL } = getConfig(env);
       let telegramCheck = "not tested";
       try {
         const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getMe`);
@@ -230,25 +230,25 @@ export default {
       } catch (e) {
         kvCheck = `KV failed: ${e.message}`;
       }
-      let apinexCheck = "not tested";
+      let xkiroCheck = "not tested";
       try {
-        const r2 = await fetch("https://api.apinex.bond/v1/chat/completions", {
+        const r2 = await fetch("https://api.xkiro.com/v1/chat/completions", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "Authorization": `Bearer ${APINEX_API_KEY}`,
+            "Authorization": `Bearer ${XKIRO_API_KEY}`,
           },
           body: JSON.stringify({
-            model: APINEX_MODEL,
+            model: XKIRO_MODEL,
             messages: [{ role: "user", content: "2+2 kitna hota hai, ek shabd me jawab do" }],
           }),
         });
-        apinexCheck = await r2.json();
+        xkiroCheck = await r2.json();
       } catch (e) {
-        apinexCheck = `fetch failed: ${e.message}`;
+        xkiroCheck = `fetch failed: ${e.message}`;
       }
       return new Response(
-        JSON.stringify({ telegramCheck, kvCheck, apinexCheck }, null, 2),
+        JSON.stringify({ telegramCheck, kvCheck, xkiroCheck }, null, 2),
         { headers: { "Content-Type": "application/json" } }
       );
     }
@@ -285,7 +285,7 @@ export default {
       const chatId = message.chat.id;
       const userId = message.from.id;
 
-      // Agar photo/image bheji hai to seedha fixed reply do, APInex ko mat bhejo
+      // Agar photo/image bheji hai to seedha fixed reply do, Xkiro ko mat bhejo
       if (message.photo || message.document) {
         ctx.waitUntil(sendMessage(env, chatId, PHOTO_REPLY));
         return new Response("ok");
@@ -325,7 +325,7 @@ async function handleMessage(env, chatId, userId, text) {
       return;
     }
 
-    const answer = await askApinexWithTyping(env, chatId, text);
+    const answer = await askXkiroWithTyping(env, chatId, text);
     await sendMessage(env, chatId, answer);
   } catch (err) {
     try {
