@@ -245,57 +245,132 @@ async function setSession(env, s) {
   else await env.BOT_DATA.put("admin_session", j(s));
 }
 
-// ---------- rate limit ----------
+// ---------- rate limit (Durable Object backed — atomic, no race conditions) ----------
+async function rateLimiterFetch(env, userId, path, body) {
+  const id = env.RATE_LIMITER.idFromName(String(userId));
+  const stub = env.RATE_LIMITER.get(id);
+  const res = await stub.fetch("https://do/" + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return res.json();
+}
+
+async function resetRateLimiter(env, userId) {
+  return rateLimiterFetch(env, userId, "reset");
+}
+
+async function getRateLimiterStatus(env, userId) {
+  return rateLimiterFetch(env, userId, "status");
+}
+
 async function checkAndConsumeLimit(env, user) {
   const settings = await getSettings(env);
 
-  // paid plan handling
+  let limitCount, windowHours, limitMessageTemplate;
+
   if (user.plan_id && user.plan_expires_at && user.plan_expires_at > now()) {
     const plan = await getPlan(env, user.plan_id);
     if (plan) {
-      const windowMs = plan.limit_window_hours * 3600000;
-      if (now() - user.window_start >= windowMs) {
-        user.window_start = now();
-        user.window_count = 0;
-      }
-      if (user.window_count >= plan.limit_count) {
-        const resetAt = user.window_start + windowMs;
-        return {
-          allowed: false,
-          message: (plan.limit_reached_message || "Limit reached. Resets at {reset_time}").replace(
-            "{reset_time}",
-            fmtTime(resetAt)
-          ),
-        };
-      }
-      user.window_count += 1;
-      return { allowed: true };
+      limitCount = plan.limit_count;
+      windowHours = plan.limit_window_hours;
+      limitMessageTemplate = plan.limit_reached_message || "Limit reached. Resets at {reset_time}";
     }
   }
 
-  // plan expired -> revert to free
-  if (user.plan_id && (!user.plan_expires_at || user.plan_expires_at <= now())) {
-    user.plan_id = null;
-    user.plan_expires_at = null;
-    user.window_start = now();
-    user.window_count = 0;
+  if (limitCount === undefined) {
+    // plan missing/expired -> revert to free
+    if (user.plan_id && (!user.plan_expires_at || user.plan_expires_at <= now())) {
+      user.plan_id = null;
+      user.plan_expires_at = null;
+    }
+    limitCount = settings.free_limit_count;
+    windowHours = settings.free_limit_window_hours;
+    limitMessageTemplate = settings.free_limit_reached_message;
   }
 
-  // free plan
-  const windowMs = settings.free_limit_window_hours * 3600000;
-  if (now() - user.window_start >= windowMs) {
-    user.window_start = now();
-    user.window_count = 0;
+  const windowMs = Number(windowHours) * 3600000;
+  const data = await rateLimiterFetch(env, user.id, "check", { limitCount: Number(limitCount), windowMs });
+
+  if (!data.allowed) {
+    const resetAt = data.window_start + windowMs;
+    return { allowed: false, message: limitMessageTemplate.replace("{reset_time}", fmtTime(resetAt)) };
   }
-  if (user.window_count >= settings.free_limit_count) {
-    const resetAt = user.window_start + windowMs;
-    return {
-      allowed: false,
-      message: settings.free_limit_reached_message.replace("{reset_time}", fmtTime(resetAt)),
-    };
-  }
-  user.window_count += 1;
   return { allowed: true };
+}
+
+// ---------- Durable Object: atomic per-user rate limiter ----------
+export class RateLimiterDO {
+  constructor(state) {
+    this.state = state;
+  }
+  async fetch(request) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/reset") {
+      const data = { window_start: Date.now(), count: 0 };
+      await this.state.storage.put("data", data);
+      return new Response(JSON.stringify({ ok: true, ...data }));
+    }
+
+    if (url.pathname === "/status") {
+      const data = (await this.state.storage.get("data")) || { window_start: Date.now(), count: 0 };
+      return new Response(JSON.stringify(data));
+    }
+
+    // /check — atomic because a Durable Object processes one request at a time
+    const { limitCount, windowMs } = await request.json();
+    let data = (await this.state.storage.get("data")) || { window_start: Date.now(), count: 0 };
+    const t = Date.now();
+    if (t - data.window_start >= windowMs) {
+      data = { window_start: t, count: 0 };
+    }
+    let allowed;
+    if (data.count >= limitCount) {
+      allowed = false;
+    } else {
+      data.count += 1;
+      allowed = true;
+    }
+    await this.state.storage.put("data", data);
+    return new Response(JSON.stringify({ allowed, window_start: data.window_start, count: data.count }));
+  }
+}
+
+// ---------- exact computation for big numbers (LLMs get these wrong) ----------
+function tryDirectCompute(question) {
+  const q = question.trim();
+
+  // pure power expression: a ^ b  (integers only)
+  let m = q.match(/^(-?\d+)\s*\^\s*(\d+)$/);
+  if (m) {
+    const baseStr = m[1];
+    const exp = parseInt(m[2], 10);
+    if (exp >= 0 && exp <= 3000) {
+      const result = BigInt(baseStr) ** BigInt(exp);
+      return (
+        `हल:\n${baseStr}^${exp} का मान ज्ञात करने के लिए ${baseStr} को स्वयं से ${exp} बार गुणा किया जाता है (successive squaring विधि से आसानी से गणना की जा सकती है)।\n\n` +
+        `<b>${baseStr}^${exp} = ${result.toString()}</b>`
+      );
+    }
+  }
+
+  // factorial: n!
+  m = q.match(/^(\d+)\s*!$/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (n >= 0 && n <= 1000) {
+      let result = 1n;
+      for (let i = 2n; i <= BigInt(n); i++) result *= i;
+      return (
+        `हल:\n${n}! = ${n} × ${n - 1} × ... × 2 × 1 (सभी पूर्णांकों 1 से ${n} तक का गुणनफल)\n\n` +
+        `<b>${n}! = ${result.toString()}</b>`
+      );
+    }
+  }
+
+  return null;
 }
 
 // ---------- Groq ----------
@@ -528,9 +603,8 @@ async function handleAdminText(env, chatId, text) {
     }
     target.plan_id = plan.id;
     target.plan_expires_at = now() + plan.validity_days * 86400000;
-    target.window_start = now();
-    target.window_count = 0;
     await saveUser(env, target);
+    await resetRateLimiter(env, target.id);
     await sendMessage(
       env,
       chatId,
@@ -578,6 +652,7 @@ async function showUserDetail(env, chatId, userId) {
   const u = await getUser(env, userId);
   if (!u) return sendMessage(env, chatId, "User not found.");
   const plan = u.plan_id ? await getPlan(env, u.plan_id) : null;
+  const rl = await getRateLimiterStatus(env, u.id);
   const hist = (u.history || [])
     .slice(-10)
     .map((h) => `• [${fmtTime(h.ts)}]\nQ: ${h.q}\nA: ${(h.a || "").slice(0, 200)}`)
@@ -587,7 +662,7 @@ async function showUserDetail(env, chatId, userId) {
     `ID: <code>${u.id}</code>\n` +
     `Joined: ${fmtTime(u.joined_at)}\n` +
     `Plan: ${plan ? plan.name + " (till " + fmtTime(u.plan_expires_at) + ")" : "Free"}\n` +
-    `Usage this window: ${u.window_count}\n\n` +
+    `Usage this window: ${rl.count || 0}\n\n` +
     `📜 Last messages (up to 8 din):\n${hist || "—"}`;
   await sendMessage(env, chatId, text, {
     reply_markup: {
@@ -775,9 +850,8 @@ async function handleUpdate(env, update) {
     if (plan) {
       user.plan_id = plan.id;
       user.plan_expires_at = now() + plan.validity_days * 86400000;
-      user.window_start = now();
-      user.window_count = 0;
       await saveUser(env, user);
+      await resetRateLimiter(env, user.id);
       await sendMessage(env, chatId, `✅ Payment successful! <b>${plan.name}</b> activate ho gaya.`);
     }
     return;
@@ -832,11 +906,16 @@ async function handleUpdate(env, update) {
   }
 
   const settings = await getSettings(env);
+  const direct = tryDirectCompute(msg.text);
   let answer;
-  try {
-    answer = await askGroq(env, msg.text);
-  } catch (e) {
-    answer = "";
+  if (direct) {
+    answer = direct;
+  } else {
+    try {
+      answer = await askGroq(env, msg.text);
+    } catch (e) {
+      answer = "";
+    }
   }
 
   if (!answer || answer.includes("###NOT_MATH###")) {
