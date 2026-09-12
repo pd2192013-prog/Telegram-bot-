@@ -7,7 +7,7 @@ compatibility_date = "2024-11-01"
 # Then paste the returned id below.
 [[kv_namespaces]]
 binding = "BOT_DATA"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+id = "5c84e6fcca79410b869162d9606057e8"
 
 # Durable Object used ONLY for atomic per-user rate limiting (accurate counting,
 # no race conditions even if many messages arrive at the same time).
