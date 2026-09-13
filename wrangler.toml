@@ -17,7 +17,7 @@ class_name = "RateLimiterDO"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["RateLimiterDO"]
+new_sqlite_classes = ["RateLimiterDO"]
 
 # Secrets (set these with `npx wrangler secret put NAME`, do NOT put them here):
 #   BOT_TOKEN        -> your Telegram bot token from @BotFather
