@@ -135,7 +135,7 @@ async function getSettings(env) {
   const raw = await env.BOT_DATA.get("settings");
   const def = {
     welcome_message:
-      "🙏 नमस्ते! मैं आपका Maths Doubt Solving Bot हूँ।\nयहाँ अपना गणित (Maths) से जुड़ा कोई भी सवाल टेक्स्ट में भेजिए, मैं step-by-step हल बताऊँगा।\n\nअपना प्लान देखने के लिए /plans भेजें।",
+      "🙏 नमस्ते! मैं आपका Maths Doubt Solving Bot हूँ।\nयहाँ अपना गणित (Maths) से जुड़ा कोई भी सवाल टेक्स्ट में भेजिए, मैं step-by-step हल बताऊँगा।\n\nQuiz खेलने के लिए /quiz भेजें। अपना प्लान देखने के लिए /plans भेजें।",
     free_limit_count: 20,
     free_limit_window_hours: 5,
     free_limit_reached_message:
@@ -144,6 +144,13 @@ async function getSettings(env) {
       "माफ़ कीजिए 🙏, मैं केवल Maths से जुड़े सवालों के जवाब देता हूँ। कृपया अपना गणित का प्रश्न भेजें।",
     photo_reply:
       "कृपया अपना सवाल फोटो की जगह टेक्स्ट में लिखकर भेजें 🙏",
+    // quiz-specific settings
+    quiz_classes: "8,9,10",
+    free_quiz_limit_count: 10,
+    free_quiz_limit_reached_message:
+      "⚠️ आपकी आज की फ्री Quiz सीमा खत्म हो गई है।\nयह सीमा रीसेट होगी: {reset_time}\n\nज़्यादा Quiz सवालों के लिए /plans देखें।",
+    quiz_correct_message: "बधाई हो 👏 आपका उत्तर सही है",
+    quiz_wrong_prefix: "आपका उत्तर गलत है सही उत्तर है",
   };
   if (!raw) {
     await env.BOT_DATA.put("settings", j(def));
@@ -153,6 +160,13 @@ async function getSettings(env) {
 }
 async function saveSettings(env, s) {
   await env.BOT_DATA.put("settings", j(s));
+}
+
+function getQuizClasses(settings) {
+  return String(settings.quiz_classes || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 async function getUser(env, id) {
@@ -258,7 +272,9 @@ async function rateLimiterFetch(env, userId, path, body) {
 }
 
 async function resetRateLimiter(env, userId) {
-  return rateLimiterFetch(env, userId, "reset");
+  await rateLimiterFetch(env, userId, "reset");
+  await rateLimiterFetch(env, "quiz_" + userId, "reset");
+  return true;
 }
 
 async function getRateLimiterStatus(env, userId) {
@@ -292,6 +308,43 @@ async function checkAndConsumeLimit(env, user) {
 
   const windowMs = Number(windowHours) * 3600000;
   const data = await rateLimiterFetch(env, user.id, "check", { limitCount: Number(limitCount), windowMs });
+
+  if (!data.allowed) {
+    const resetAt = data.window_start + windowMs;
+    return { allowed: false, message: limitMessageTemplate.replace("{reset_time}", fmtTime(resetAt)) };
+  }
+  return { allowed: true };
+}
+
+// quiz limit uses the SAME window/validity as the plan's normal doubt limit,
+// but a SEPARATE question count and a separate counter key ("quiz_"+userId)
+async function checkAndConsumeQuizLimit(env, user) {
+  const settings = await getSettings(env);
+
+  let limitCount, windowHours, limitMessageTemplate;
+
+  if (user.plan_id && user.plan_expires_at && user.plan_expires_at > now()) {
+    const plan = await getPlan(env, user.plan_id);
+    if (plan) {
+      limitCount = plan.quiz_limit_count;
+      windowHours = plan.limit_window_hours;
+      limitMessageTemplate =
+        plan.quiz_limit_reached_message || "Quiz limit khatam ho gayi hai. Reset hogi: {reset_time}";
+    }
+  }
+
+  if (limitCount === undefined || limitCount === null || isNaN(Number(limitCount))) {
+    if (user.plan_id && (!user.plan_expires_at || user.plan_expires_at <= now())) {
+      user.plan_id = null;
+      user.plan_expires_at = null;
+    }
+    limitCount = settings.free_quiz_limit_count;
+    windowHours = settings.free_limit_window_hours;
+    limitMessageTemplate = settings.free_quiz_limit_reached_message;
+  }
+
+  const windowMs = Number(windowHours) * 3600000;
+  const data = await rateLimiterFetch(env, "quiz_" + user.id, "check", { limitCount: Number(limitCount), windowMs });
 
   if (!data.allowed) {
     const resetAt = data.window_start + windowMs;
@@ -395,6 +448,165 @@ async function askGroq(env, question) {
   return text || "";
 }
 
+// ---------- Quiz: separate Groq model, always-Hindi MCQ generator ----------
+function quizSysPrompt(classLevel, chapter) {
+  return `You are a Maths MCQ quiz question generator for Indian school Class ${classLevel} students (NCERT level).
+Always reply with STRICTLY VALID JSON ONLY — no markdown code fences, no extra commentary before or after — in exactly this shape:
+{"question": "...", "options": ["...", "...", "...", "..."], "correct_index": 0, "explanation": "..."}
+
+Rules:
+- The question MUST be strictly from this chapter only: "${chapter}" (Class ${classLevel} NCERT maths). Do not ask anything from any other chapter.
+- "question" and all 4 "options" must be written ENTIRELY IN HINDI (Devanagari script) — numbers and math symbols stay as normal digits/symbols.
+- Exactly 4 items in "options", only one correct.
+- "correct_index" is the 0-based index (0, 1, 2 or 3) of the correct option in "options".
+- "explanation" must be a short step-by-step Hindi textbook-style solution, starting with "हल:", showing the working on separate lines, and ending with the final answer wrapped in <b></b> tags.
+- NEVER use LaTeX syntax anywhere (no \\frac, \\[, \\], ^{}, \\sqrt, etc.) — use plain text symbols like × ÷ √ ° instead.
+- Vary the specific question each time within the chapter, don't repeat the same question.
+- Output must be valid JSON parseable by JSON.parse — double-quote all keys and string values, no trailing commas, no comments.`;
+}
+
+// fetch (and cache) the official NCERT chapter list for a class, in Hindi
+async function getSyllabus(env, classLevel) {
+  const key = "syllabus_" + classLevel;
+  const raw = await env.BOT_DATA.get(key);
+  if (raw) return p(raw);
+
+  const model = env.GROQ_MODEL_QUIZ || env.GROQ_MODEL;
+  try {
+    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${env.GROQ_API_KEY}`,
+      },
+      body: j({
+        model,
+        temperature: 0.2,
+        messages: [
+          {
+            role: "system",
+            content:
+              `You output STRICTLY VALID JSON ONLY, no markdown fences, no extra text, in exactly this shape: {"chapters": ["...", "...", ...]}. ` +
+              `List the official NCERT Mathematics textbook chapter names for Indian school Class ${classLevel}, in syllabus order, written in Hindi (Devanagari). Return ONLY the JSON.`,
+          },
+          { role: "user", content: `Class ${classLevel} NCERT Maths ke chapters ki list do.` },
+        ],
+      }),
+    });
+    const data = await res.json();
+    let text = (data?.choices?.[0]?.message?.content || "").trim();
+    text = text.replace(/^```json/i, "").replace(/^```/, "").replace(/```$/, "").trim();
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed.chapters) && parsed.chapters.length) {
+      const chapters = parsed.chapters.map((c) => String(c));
+      await env.BOT_DATA.put(key, j(chapters));
+      return chapters;
+    }
+  } catch (e) {}
+  return [];
+}
+
+async function showChapterSelection(env, chatId, classLevel) {
+  const chapters = await getSyllabus(env, classLevel);
+  if (!chapters.length) {
+    return sendMessage(env, chatId, "❗ Is class ka syllabus load nahi ho paya, kripya /quiz dubara try karein.");
+  }
+  const rows = chapters.map((c, i) => [{ text: c.slice(0, 60), callback_data: `quiz_chapter:${classLevel}:${i}` }]);
+  return sendMessage(env, chatId, "📖 अध्याय चुनें:", { reply_markup: { inline_keyboard: rows } });
+}
+
+function changeChapterKeyboard(classLevel) {
+  return {
+    inline_keyboard: [[{ text: "📖 अध्याय बदलने के लिए क्लिक करें", callback_data: `quiz_change_chapter:${classLevel}` }]],
+  };
+}
+
+async function askGroqQuiz(env, classLevel, chapter) {
+  const model = env.GROQ_MODEL_QUIZ || env.GROQ_MODEL;
+  try {
+    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${env.GROQ_API_KEY}`,
+      },
+      body: j({
+        model,
+        temperature: 0.7,
+        messages: [
+          { role: "system", content: quizSysPrompt(classLevel, chapter) },
+          { role: "user", content: `Class ${classLevel}, chapter "${chapter}" se ek naya MCQ maths question banao.` },
+        ],
+      }),
+    });
+    const data = await res.json();
+    let text = (data?.choices?.[0]?.message?.content || "").trim();
+    text = text.replace(/^```json/i, "").replace(/^```/, "").replace(/```$/, "").trim();
+    const parsed = JSON.parse(text);
+    if (
+      parsed &&
+      typeof parsed.question === "string" &&
+      Array.isArray(parsed.options) &&
+      parsed.options.length === 4 &&
+      Number.isInteger(parsed.correct_index) &&
+      parsed.correct_index >= 0 &&
+      parsed.correct_index <= 3
+    ) {
+      return parsed;
+    }
+  } catch (e) {}
+  return null;
+}
+
+async function sendNextQuizQuestion(env, chatId, user, classLevel, chapter) {
+  let q = await askGroqQuiz(env, classLevel, chapter);
+  if (!q) q = await askGroqQuiz(env, classLevel, chapter); // one retry
+  if (!q) {
+    return sendMessage(env, chatId, "❗ Quiz question generate karne mein dikkat aayi, kripya /quiz dubara try karein.");
+  }
+  const pollRes = await tg(env, "sendPoll", {
+    chat_id: chatId,
+    question: String(q.question).slice(0, 290),
+    options: q.options.map((o) => String(o).slice(0, 95)),
+    type: "quiz",
+    correct_option_id: q.correct_index,
+    is_anonymous: false,
+    reply_markup: changeChapterKeyboard(classLevel),
+  });
+  const pollId = pollRes?.result?.poll?.id;
+  if (!pollId) {
+    return sendMessage(env, chatId, "❗ Quiz bhejne mein dikkat aayi, kripya /quiz dubara try karein.");
+  }
+  await env.BOT_DATA.put(
+    "poll_" + pollId,
+    j({
+      userId: user.id,
+      chatId,
+      classLevel,
+      chapter,
+      correctIndex: q.correct_index,
+      correctText: q.options[q.correct_index],
+      explanation: sanitizeMathText(String(q.explanation || "")),
+    }),
+    { expirationTtl: 21600 }
+  );
+}
+
+async function startQuizForUser(env, chatId, user, classLevel, chapter) {
+  const limitCheck = await checkAndConsumeQuizLimit(env, user);
+  await saveUser(env, user);
+  if (!limitCheck.allowed) {
+    await sendMessage(env, chatId, limitCheck.message);
+    if (!user.plan_id) {
+      const settings = await getSettings(env);
+      await sendMessage(env, chatId, "📦 ज़्यादा Quiz सवालों के लिए नीचे दिए प्लान देखें:");
+      await showUserPlans(env, chatId, user);
+    }
+    return;
+  }
+  await sendNextQuizQuestion(env, chatId, user, classLevel, chapter);
+}
+
 // ---------- Admin panel ----------
 function mainMenuKeyboard() {
   return {
@@ -402,6 +614,7 @@ function mainMenuKeyboard() {
       [{ text: "📦 Plans", callback_data: "adm:plans" }, { text: "👥 Users", callback_data: "adm:users" }],
       [{ text: "📢 Broadcast", callback_data: "adm:broadcast" }, { text: "⚙️ Settings", callback_data: "adm:settings" }],
       [{ text: "🎁 Free Activate Plan", callback_data: "adm:free_activate" }],
+      [{ text: "🧩 Quiz Settings", callback_data: "adm:quizsettings" }],
       [{ text: "✖️ Close", callback_data: "adm:close" }],
     ],
   };
@@ -429,18 +642,21 @@ function planDetailText(pl) {
     `Price: ⭐ ${pl.price_stars} Telegram Stars\n` +
     `Validity: ${pl.validity_days} din\n` +
     `Limit: ${pl.limit_count} messages / ${pl.limit_window_hours} ghante\n` +
+    `Quiz: ${pl.quiz_limit_count ?? 0} poll questions / ${pl.limit_window_hours} ghante\n` +
     `Features:\n${(pl.features || []).map((f, i) => `${i + 1}. ${f}`).join("\n")}\n\n` +
-    `Limit reached message:\n${pl.limit_reached_message}`
+    `Limit reached message:\n${pl.limit_reached_message}\n\n` +
+    `Quiz limit reached message:\n${pl.quiz_limit_reached_message || "-"}`
   );
 }
 
-// shown to normal users (via /plans) - does NOT include the internal limit-reached template
+// shown to normal users (via /plans) - does NOT include the internal limit-reached templates
 function userPlanCardText(pl) {
   return (
     `📦 <b>${pl.name}</b>\n` +
     `Price: ⭐ ${pl.price_stars} Telegram Stars\n` +
     `Validity: ${pl.validity_days} din\n` +
     `Limit: ${pl.limit_count} messages / ${pl.limit_window_hours} ghante\n` +
+    `Quiz: ${pl.quiz_limit_count ?? 0} poll questions / ${pl.limit_window_hours} ghante\n` +
     `Features:\n${(pl.features || []).map((f, i) => `${i + 1}. ${f}`).join("\n")}`
   );
 }
@@ -469,6 +685,8 @@ function planEditMenuKeyboard(planId) {
     ["limit_count", "Limit count"],
     ["limit_window_hours", "Limit window (hours)"],
     ["limit_reached_message", "Limit reached message"],
+    ["quiz_limit_count", "Quiz question limit"],
+    ["quiz_limit_reached_message", "Quiz limit reached message"],
     ["features", "Features"],
   ];
   const rows = fields.map(([f, label]) => [
@@ -482,12 +700,18 @@ const ADD_PLAN_STEPS = [
   { field: "name", prompt: "Plan ka naam bhejiye:" },
   { field: "price_stars", prompt: "Kitne Telegram Stars ka price rakhna hai? (sirf number bhejein)" },
   { field: "validity_days", prompt: "Plan ki validity kitne din ki hai? (sirf number)" },
-  { field: "limit_count", prompt: "User kitne messages bhej sakega har window mein? (sirf number)" },
-  { field: "limit_window_hours", prompt: "Yeh limit kitne ghanto mein reset hogi? (sirf number)" },
+  { field: "limit_count", prompt: "User kitne doubt-solving messages bhej sakega har window mein? (sirf number)" },
+  { field: "limit_window_hours", prompt: "Yeh limit kitne ghanto mein reset hogi? (yehi window Quiz ke liye bhi use hogi) (sirf number)" },
   {
     field: "limit_reached_message",
     prompt:
-      "Jab is plan ki limit khatam ho jaye tab bot kya reply karega? (Note: {reset_time} likhna na bhoole, wahan exact reset time automatically aa jayega)",
+      "Jab is plan ki doubt-solving limit khatam ho jaye tab bot kya reply karega? (Note: {reset_time} likhna na bhoole, wahan exact reset time automatically aa jayega)",
+  },
+  { field: "quiz_limit_count", prompt: "Is plan mein user kitne QUIZ poll questions bana sakega (same window/validity)? (sirf number)" },
+  {
+    field: "quiz_limit_reached_message",
+    prompt:
+      "Jab is plan ki QUIZ limit khatam ho jaye tab bot kya reply karega? (Note: {reset_time} zaroor likhein, wahan exact reset time automatically aa jayega)",
   },
   {
     field: "features",
@@ -502,7 +726,7 @@ async function handleAdminText(env, chatId, text) {
   if (session.mode === "add_plan") {
     const step = ADD_PLAN_STEPS[session.step];
     let val = text.trim();
-    if (["price_stars", "validity_days", "limit_count", "limit_window_hours"].includes(step.field)) {
+    if (["price_stars", "validity_days", "limit_count", "limit_window_hours", "quiz_limit_count"].includes(step.field)) {
       val = parseFloat(val);
       if (isNaN(val)) {
         await sendMessage(env, chatId, "❗ Kripya sirf number bhejein.");
@@ -534,7 +758,7 @@ async function handleAdminText(env, chatId, text) {
       return true;
     }
     let val = text.trim();
-    if (["price_stars", "validity_days", "limit_count", "limit_window_hours"].includes(session.field)) {
+    if (["price_stars", "validity_days", "limit_count", "limit_window_hours", "quiz_limit_count"].includes(session.field)) {
       val = parseFloat(val);
       if (isNaN(val)) {
         await sendMessage(env, chatId, "❗ Kripya sirf number bhejein.");
@@ -559,6 +783,24 @@ async function handleAdminText(env, chatId, text) {
     await setSession(env, null);
     await sendMessage(env, chatId, "✅ Setting update ho gayi!");
     await showSettingsMenu(env, chatId);
+    return true;
+  }
+
+  if (session.mode === "edit_quiz_setting") {
+    const settings = await getSettings(env);
+    let val = text.trim();
+    if (session.field === "free_quiz_limit_count") {
+      val = parseFloat(val);
+      if (isNaN(val)) {
+        await sendMessage(env, chatId, "❗ Kripya sirf number bhejein.");
+        return true;
+      }
+    }
+    settings[session.field] = val;
+    await saveSettings(env, settings);
+    await setSession(env, null);
+    await sendMessage(env, chatId, "✅ Quiz setting update ho gayi!");
+    await showQuizSettingsMenu(env, chatId);
     return true;
   }
 
@@ -693,6 +935,26 @@ async function showSettingsMenu(env, chatId) {
   await sendMessage(env, chatId, `⚙️ <b>Settings</b>\n\n${preview}`, { reply_markup: { inline_keyboard: rows } });
 }
 
+async function showQuizSettingsMenu(env, chatId) {
+  const s = await getSettings(env);
+  const fields = [
+    ["quiz_classes", "🏫 Classes (comma-separated)"],
+    ["free_quiz_limit_count", "🔢 Free quiz question limit"],
+    ["free_quiz_limit_reached_message", "🚫 Free quiz limit reached msg"],
+    ["quiz_correct_message", "✅ Correct-answer message"],
+    ["quiz_wrong_prefix", "❌ Wrong-answer message prefix"],
+  ];
+  const rows = fields.map(([f, label]) => [{ text: label, callback_data: "adm:quiz_setting_edit:" + f }]);
+  rows.push([{ text: "⬅️ Back", callback_data: "adm:menu" }]);
+  const preview = fields.map(([f, label]) => `${label}: ${String(s[f]).slice(0, 60)}`).join("\n");
+  await sendMessage(
+    env,
+    chatId,
+    `🧩 <b>Quiz Settings</b>\n(free quiz limit resets har ${s.free_limit_window_hours} ghante mein — yehi window jo doubt-solving free limit ki hai)\n\n${preview}`,
+    { reply_markup: { inline_keyboard: rows } }
+  );
+}
+
 async function handleAdminCallback(env, chatId, data) {
   if (data === "adm:menu") return showMainMenu(env, chatId);
   if (data === "adm:close") return sendMessage(env, chatId, "Panel band kar diya gaya. Dubara kholne ke liye password bhejein.");
@@ -700,6 +962,7 @@ async function handleAdminCallback(env, chatId, data) {
   if (data === "adm:users") return showUsersMenu(env, chatId, 0);
   if (data.startsWith("adm:users_page:")) return showUsersMenu(env, chatId, parseInt(data.split(":")[2]));
   if (data === "adm:settings") return showSettingsMenu(env, chatId);
+  if (data === "adm:quizsettings") return showQuizSettingsMenu(env, chatId);
 
   if (data === "adm:broadcast") {
     await setSession(env, { mode: "broadcast" });
@@ -734,6 +997,8 @@ async function handleAdminCallback(env, chatId, data) {
       limit_count: "Naya limit count bhejein:",
       limit_window_hours: "Naya limit window (hours) bhejein:",
       limit_reached_message: "Naya limit-reached message bhejein ({reset_time} zaroor rakhein):",
+      quiz_limit_count: "Naya quiz question limit bhejein (sirf number):",
+      quiz_limit_reached_message: "Naya quiz limit-reached message bhejein ({reset_time} zaroor rakhein):",
       features: "Naye features bhejein, har ek naye line par:",
     };
     return sendMessage(env, chatId, labels[field] || "Naya value bhejein:");
@@ -777,6 +1042,16 @@ async function handleAdminCallback(env, chatId, data) {
     const field = data.split(":")[2];
     await setSession(env, { mode: "edit_setting", field });
     return sendMessage(env, chatId, "Naya text bhejein:");
+  }
+
+  if (data.startsWith("adm:quiz_setting_edit:")) {
+    const field = data.split(":")[2];
+    await setSession(env, { mode: "edit_quiz_setting", field });
+    const hint =
+      field === "quiz_classes"
+        ? "Comma se alag karke classes bhejein, jaise: 8,9,10"
+        : "Naya text bhejein:";
+    return sendMessage(env, chatId, hint);
   }
 }
 
@@ -823,6 +1098,34 @@ async function handleUpdate(env, update) {
     return;
   }
 
+  if (update.poll_answer) {
+    const pa = update.poll_answer;
+    const chosen = Array.isArray(pa.option_ids) ? pa.option_ids[0] : undefined;
+    if (chosen === undefined || !pa.user) return; // vote retracted, ignore
+
+    const rec = await env.BOT_DATA.get("poll_" + pa.poll_id);
+    if (!rec) return;
+    const info = p(rec);
+    await env.BOT_DATA.delete("poll_" + pa.poll_id);
+
+    const settings = await getSettings(env);
+    const kb = changeChapterKeyboard(info.classLevel);
+    if (chosen === info.correctIndex) {
+      await sendMessage(env, info.chatId, settings.quiz_correct_message, { reply_markup: kb });
+    } else {
+      await sendMessage(
+        env,
+        info.chatId,
+        `${settings.quiz_wrong_prefix} <b>${info.correctText}</b>\n\n${info.explanation}`,
+        { reply_markup: kb }
+      );
+    }
+
+    const { user } = await ensureUser(env, pa.user);
+    await startQuizForUser(env, info.chatId, user, info.classLevel, info.chapter);
+    return;
+  }
+
   if (update.callback_query) {
     const cq = update.callback_query;
     const chatId = cq.message.chat.id;
@@ -830,6 +1133,22 @@ async function handleUpdate(env, update) {
     await answerCallback(env, cq.id);
     if (cq.data.startsWith("buy:")) {
       return buyPlan(env, chatId, cq.data.split(":")[1]);
+    }
+    if (cq.data.startsWith("quiz_class:")) {
+      const classLevel = cq.data.split(":")[1];
+      return showChapterSelection(env, chatId, classLevel);
+    }
+    if (cq.data.startsWith("quiz_change_chapter:")) {
+      const classLevel = cq.data.split(":")[1];
+      return showChapterSelection(env, chatId, classLevel);
+    }
+    if (cq.data.startsWith("quiz_chapter:")) {
+      const [, classLevel, idxStr] = cq.data.split(":");
+      const chapters = await getSyllabus(env, classLevel);
+      const chapter = chapters[parseInt(idxStr, 10)];
+      if (!chapter) return sendMessage(env, chatId, "❗ Chapter nahi mila, /quiz dubara try karein.");
+      const { user } = await ensureUser(env, cq.from);
+      return startQuizForUser(env, chatId, user, classLevel, chapter);
     }
     if (cq.data.startsWith("adm:") && fromId === adminId(env)) {
       return handleAdminCallback(env, chatId, cq.data);
@@ -887,6 +1206,20 @@ async function handleUpdate(env, update) {
     await showUserPlans(env, chatId, user);
     await saveUser(env, user);
     return;
+  }
+
+  if (msg.text && msg.text.startsWith("/quiz")) {
+    const settings = await getSettings(env);
+    const classes = getQuizClasses(settings);
+    await saveUser(env, user);
+    if (!classes.length) {
+      return sendMessage(env, chatId, "Abhi Quiz available nahi hai, thodi der baad try karein.");
+    }
+    const rows = [];
+    for (let i = 0; i < classes.length; i += 3) {
+      rows.push(classes.slice(i, i + 3).map((c) => ({ text: `Class ${c}`, callback_data: `quiz_class:${c}` })));
+    }
+    return sendMessage(env, chatId, "📝 किस Class का Maths Quiz चाहिए?", { reply_markup: { inline_keyboard: rows } });
   }
 
   if (msg.photo || msg.document) {
