@@ -517,7 +517,10 @@ async function showChapterSelection(env, chatId, classLevel) {
 
 function changeChapterKeyboard(classLevel) {
   return {
-    inline_keyboard: [[{ text: "📖 अध्याय बदलने के लिए क्लिक करें", callback_data: `quiz_change_chapter:${classLevel}` }]],
+    inline_keyboard: [
+      [{ text: "📖 अध्याय बदलने के लिए क्लिक करें", callback_data: `quiz_change_chapter:${classLevel}` }],
+      [{ text: "❌ Quiz बंद करें", callback_data: "quiz_stop" }],
+    ],
   };
 }
 
@@ -1133,6 +1136,9 @@ async function handleUpdate(env, update) {
     await answerCallback(env, cq.id);
     if (cq.data.startsWith("buy:")) {
       return buyPlan(env, chatId, cq.data.split(":")[1]);
+    }
+    if (cq.data === "quiz_stop") {
+      return sendMessage(env, chatId, "✅ Quiz बंद कर दिया गया है। दुबारा शुरू करने के लिए /quiz भेजें।");
     }
     if (cq.data.startsWith("quiz_class:")) {
       const classLevel = cq.data.split(":")[1];
