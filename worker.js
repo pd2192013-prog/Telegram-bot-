@@ -729,9 +729,14 @@ async function askGeminiVision(env, imageParts, promptText) {
       .map((pt) => pt.text || "")
       .join("\n")
       .trim();
-    return text || "";
+    if (!text) {
+      // TEMPORARY DEBUG: surface exactly what Gemini returned instead of silently failing,
+      // so we can see the real error (bad key, wrong model name, blocked content, etc.)
+      return "###GEMINI_DEBUG### status=" + res.status + " body=" + JSON.stringify(data).slice(0, 1200);
+    }
+    return text;
   } catch (e) {
-    return "";
+    return "###GEMINI_DEBUG### fetch_error=" + String(e && e.message ? e.message : e);
   }
 }
 
@@ -795,6 +800,12 @@ async function processImageBatch(env, chatId, fromUserTg, files, caption) {
     : "In images/PDF mein jo bhi maths ke sawal hain unhe pehchano aur poora step-by-step solution do.";
 
   const rawAnswer = await askGeminiVision(env, parts, instruction);
+
+  if (rawAnswer && rawAnswer.startsWith("###GEMINI_DEBUG###")) {
+    // TEMPORARY: show the raw error so we can diagnose (remove once fixed)
+    await sendMessage(env, chatId, "⚠️ DEBUG:\n" + rawAnswer.replace("###GEMINI_DEBUG### ", ""));
+    return;
+  }
 
   let clean;
   if (!rawAnswer || rawAnswer.includes("###NOT_MATH###")) {
