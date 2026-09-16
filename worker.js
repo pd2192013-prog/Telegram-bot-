@@ -433,8 +433,10 @@ export class MediaGroupDO {
       chatId: body.chatId,
       fromUser: body.fromUser,
       files: [],
+      caption: "",
     };
     data.files.push({ fileId: body.fileId, mimeType: body.mimeType });
+    if (body.caption) data.caption = body.caption;
     await this.state.storage.put("data", data);
     await this.state.storage.setAlarm(Date.now() + 1500);
     return new Response("ok");
@@ -444,7 +446,7 @@ export class MediaGroupDO {
     if (!data) return;
     await this.state.storage.delete("data");
     try {
-      await processImageBatch(this.env, data.chatId, data.fromUser, data.files);
+      await processImageBatch(this.env, data.chatId, data.fromUser, data.files, data.caption);
     } catch (e) {}
   }
 }
@@ -712,7 +714,7 @@ async function askGeminiVision(env, imageParts, promptText) {
   try {
     const parts = [
       { text: GEMINI_SYS_PROMPT + "\n\nUser instruction: " + promptText },
-      ...imageParts.map((p) => ({ inline_data: { mime_type: p.mimeType, data: p.data } })),
+      ...imageParts.map((p) => ({ inlineData: { mimeType: p.mimeType, data: p.data } })),
     ];
     const res = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`,
@@ -733,7 +735,7 @@ async function askGeminiVision(env, imageParts, promptText) {
   }
 }
 
-async function processImageBatch(env, chatId, fromUserTg, files) {
+async function processImageBatch(env, chatId, fromUserTg, files, caption) {
   const { user } = await ensureUser(env, fromUserTg);
   const settings = await getSettings(env);
   const count = files.length;
@@ -788,11 +790,11 @@ async function processImageBatch(env, chatId, fromUserTg, files) {
     return sendMessage(env, chatId, "❗ फोटो/PDF download करने में दिक्कत आई, कृपया दुबारा try करें।");
   }
 
-  const rawAnswer = await askGeminiVision(
-    env,
-    parts,
-    "In images/PDF mein jo bhi maths ke sawal hain unhe pehchano aur poora step-by-step solution do."
-  );
+  const instruction = caption && caption.trim()
+    ? `User ne yeh likha hai apni photo/PDF ke saath: "${caption.trim()}". Isi instruction ke hisaab se jawab do — agar user ne kisi specific question number ka jawab maanga hai (jaise "19 number batao"), to sirf usi sawal ka poora solution do. Agar user ne kuch specific nahi poocha, to image/PDF mein jo bhi maths ke sawal hain unhe pehchano aur poora step-by-step solution do.`
+    : "In images/PDF mein jo bhi maths ke sawal hain unhe pehchano aur poora step-by-step solution do.";
+
+  const rawAnswer = await askGeminiVision(env, parts, instruction);
 
   let clean;
   if (!rawAnswer || rawAnswer.includes("###NOT_MATH###")) {
@@ -803,7 +805,7 @@ async function processImageBatch(env, chatId, fromUserTg, files) {
   await sendMessage(env, chatId, clean);
 
   // cache this image/pdf context so follow-up TEXT questions about it use the doubt-solving limit, not the image limit
-  await env.BOT_DATA.put("img_ctx_" + user.id, j({ images: parts }), { expirationTtl: 21600 });
+  await env.BOT_DATA.put("img_ctx_" + user.id, j({ images: parts }), { expirationTtl: 1800 });
 
   user.image_history = user.image_history || [];
   user.image_history.push({
@@ -838,12 +840,12 @@ async function handleIncomingMedia(env, msg) {
     await stub.fetch("https://do/add", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: j({ chatId, fromUser: msg.from, fileId, mimeType }),
+      body: j({ chatId, fromUser: msg.from, fileId, mimeType, caption: msg.caption || "" }),
     });
     return;
   }
 
-  return processImageBatch(env, chatId, msg.from, [{ fileId, mimeType }]);
+  return processImageBatch(env, chatId, msg.from, [{ fileId, mimeType }], msg.caption || "");
 }
 
 // ---------- Admin panel ----------
@@ -1676,8 +1678,12 @@ async function handleUpdate(env, update) {
   const settings = await getSettings(env);
   const imgCtxRaw = await env.BOT_DATA.get("img_ctx_" + user.id);
   let answer;
-  if (imgCtxRaw) {
-    // follow-up question about the last uploaded image/pdf — uses Gemini + cached image,
+  const direct = tryDirectCompute(msg.text);
+  if (direct) {
+    // a plain calculation like "45^54" is always handled directly — never routed to the image model
+    answer = direct;
+  } else if (imgCtxRaw) {
+    // possible follow-up question about the last uploaded image/pdf — try Gemini + cached image first,
     // counted against the normal TEXT/doubt limit (already consumed above), NOT the image limit
     const ctx = p(imgCtxRaw);
     try {
@@ -1685,16 +1691,20 @@ async function handleUpdate(env, update) {
     } catch (e) {
       answer = "";
     }
-  } else {
-    const direct = tryDirectCompute(msg.text);
-    if (direct) {
-      answer = direct;
-    } else {
+    // SAFETY NET: if that didn't produce a real math answer (e.g. this question has nothing
+    // to do with the cached image, or the image call failed), fall back to the normal
+    // doubt-solving model (Groq) instead of wrongly declaring it "not maths"
+    if (!answer || answer.includes("###NOT_MATH###")) {
       try {
-        answer = await askGroq(env, msg.text);
-      } catch (e) {
-        answer = "";
-      }
+        const fallback = await askGroq(env, msg.text);
+        if (fallback) answer = fallback;
+      } catch (e) {}
+    }
+  } else {
+    try {
+      answer = await askGroq(env, msg.text);
+    } catch (e) {
+      answer = "";
     }
   }
 
