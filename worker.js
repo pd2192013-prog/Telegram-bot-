@@ -183,6 +183,8 @@ async function getSettings(env) {
     // referral system
     referral_reward_plan_id: "",
     referral_reward_days: 0,
+    referral_info_message:
+      "🔗 <b>Apna Referral Link</b>\n\n{link}\n\n🎁 Refer karne par kya milega:\n{reward_text}\n\nApne doston ko yeh link bhejiye — jab woh bot use karke apna pehla sawal solve karwa lenge, unka referral \"verified\" ho jayega aur aapko turant yeh reward mil jayega!\n\n✅ Ab tak verified referrals: {count}",
     // plan expiry reminder (sent automatically 4 days before expiry)
     plan_expiry_reminder_message:
       "⏰ याद दिलाना चाहते हैं: आपका <b>{plan_name}</b> प्लान जल्द खत्म होने वाला है।\nसमाप्ति समय: {reset_time}\n\nसमय रहते renew करने के लिए /plans देखें।",
@@ -365,6 +367,15 @@ async function getRateLimiterStatus(env, userId) {
   return rateLimiterFetch(env, userId, "status");
 }
 
+async function getUserMode(env, userId) {
+  const r = await rateLimiterFetch(env, userId, "mode_get");
+  return r.mode || "chat";
+}
+
+async function setUserMode(env, userId, mode) {
+  await rateLimiterFetch(env, userId, "mode_set", { mode });
+}
+
 async function checkAndConsumeLimit(env, user) {
   const settings = await getSettings(env);
 
@@ -454,6 +465,19 @@ export class RateLimiterDO {
     if (url.pathname === "/status") {
       const data = (await this.state.storage.get("data")) || { window_start: Date.now(), count: 0 };
       return new Response(JSON.stringify(data));
+    }
+
+    // strongly-consistent user "mode" flag (chat vs image_panel) — KV has eventual
+    // consistency lag, so this is stored here instead to avoid stale reads right
+    // after switching modes
+    if (url.pathname === "/mode_get") {
+      const mode = (await this.state.storage.get("mode")) || "chat";
+      return new Response(JSON.stringify({ mode }));
+    }
+    if (url.pathname === "/mode_set") {
+      const { mode } = await request.json();
+      await this.state.storage.put("mode", mode);
+      return new Response(JSON.stringify({ ok: true, mode }));
     }
 
     // /check — atomic because a Durable Object processes one request at a time
@@ -1157,6 +1181,16 @@ async function handleAdminText(env, chatId, text) {
     return true;
   }
 
+  if (session.mode === "edit_referral_message") {
+    const settings = await getSettings(env);
+    settings.referral_info_message = text;
+    await saveSettings(env, settings);
+    await setSession(env, null);
+    await sendMessage(env, chatId, "✅ /refer message text update ho gaya!");
+    await showReferralSettingsMenu(env, chatId);
+    return true;
+  }
+
   if (session.mode === "free_activate_uid") {
     const uid = text.trim();
     const target = await getUser(env, uid);
@@ -1397,6 +1431,7 @@ async function showReferralSettingsMenu(env, chatId) {
   const plan = s.referral_reward_plan_id ? await getPlan(env, s.referral_reward_plan_id) : null;
   const rows = [
     [{ text: "✏️ Edit Reward Plan", callback_data: "adm:referral_edit" }],
+    [{ text: "📝 Edit /refer Message Text", callback_data: "adm:referral_edit_message" }],
     [{ text: "⬅️ Back", callback_data: "adm:menu" }],
   ];
   const summary = plan
@@ -1405,7 +1440,7 @@ async function showReferralSettingsMenu(env, chatId) {
   await sendMessage(
     env,
     chatId,
-    `🔗 <b>Referral Settings</b>\n\nJab koi user apna referral link share karega aur naya user pehla sawal solve karwa lega (verification), referrer ko yeh reward milega:\n\n${summary}`,
+    `🔗 <b>Referral Settings</b>\n\nJab koi user apna referral link share karega aur naya user pehla sawal solve karwa lega (verification), referrer ko yeh reward milega:\n\n${summary}\n\nCurrent /refer message text:\n${s.referral_info_message.slice(0, 200)}...`,
     { reply_markup: { inline_keyboard: rows } }
   );
 }
@@ -1425,6 +1460,16 @@ async function handleAdminCallback(env, chatId, data) {
   if (data === "adm:quizsettings") return showQuizSettingsMenu(env, chatId);
   if (data === "adm:imagesettings") return showImageSettingsMenu(env, chatId);
   if (data === "adm:referralsettings") return showReferralSettingsMenu(env, chatId);
+
+  if (data === "adm:referral_edit_message") {
+    await setSession(env, { mode: "edit_referral_message" });
+    return sendMessage(
+      env,
+      chatId,
+      "Naya /refer message text bhejein। In placeholders ka use kar sakte hain:\n{link} = user ka referral link\n{reward_text} = reward ki detail (plan naam + din)\n{count} = ab tak ke verified referrals",
+      { reply_markup: cancelKeyboard() }
+    );
+  }
 
   if (data === "adm:referral_edit") {
     const plans = await listPlans(env);
@@ -1617,8 +1662,7 @@ function panelBackKeyboard() {
 }
 
 async function enterImagePanel(env, chatId, user) {
-  user.mode = "image_panel";
-  await saveUser(env, user);
+  await setUserMode(env, user.id, "image_panel");
   await sendMessage(
     env,
     chatId,
@@ -1628,8 +1672,7 @@ async function enterImagePanel(env, chatId, user) {
 }
 
 async function exitImagePanel(env, chatId, user) {
-  user.mode = "chat";
-  await saveUser(env, user);
+  await setUserMode(env, user.id, "chat");
   await sendMessage(env, chatId, "✅ Aap wapas normal Chat mein aa gaye hain। Ab apna maths sawal seedha text mein bhej sakte hain।");
 }
 
@@ -1639,12 +1682,20 @@ async function showReferralInfo(env, chatId, user) {
   if (!username) {
     return sendMessage(env, chatId, "❗ Referral link generate nahi ho payi, thodi der baad try karein.");
   }
+  const settings = await getSettings(env);
+  let rewardText = "free reward";
+  if (settings.referral_reward_plan_id && Number(settings.referral_reward_days) > 0) {
+    const plan = await getPlan(env, settings.referral_reward_plan_id);
+    if (plan) {
+      rewardText = `<b>${plan.name}</b> plan <b>${settings.referral_reward_days} din</b> ke liye FREE`;
+    }
+  }
   const link = `https://t.me/${username}?start=ref_${user.id}`;
-  await sendMessage(
-    env,
-    chatId,
-    `🔗 <b>Apna Referral Link</b>\n\n${link}\n\nApne doston ko yeh link bhejiye — jab woh bot use karke apna pehla sawal solve karwa lenge, unka referral "verified" ho jayega aur aapko free reward mil jayega! 🎁\n\n✅ Ab tak verified referrals: <b>${count}</b>`
-  );
+  const text = settings.referral_info_message
+    .replace("{link}", link)
+    .replace("{reward_text}", rewardText)
+    .replace("{count}", String(count));
+  await sendMessage(env, chatId, text);
 }
 
 async function showQuizResult24h(env, chatId, user) {
@@ -1822,7 +1873,7 @@ async function handleUpdate(env, update) {
 
   if (msg.text && msg.text.startsWith("/start")) {
     const settings = await getSettings(env);
-    user.mode = "chat";
+    await setUserMode(env, user.id, "chat");
     await saveUser(env, user);
     await sendMessage(env, chatId, settings.welcome_message);
     return;
@@ -1866,7 +1917,8 @@ async function handleUpdate(env, update) {
   }
 
   if (msg.photo || msg.document) {
-    if (user.mode !== "image_panel") {
+    const currentMode = await getUserMode(env, user.id);
+    if (currentMode !== "image_panel") {
       return sendMessage(env, chatId, "फोटो से प्रश्न पूछने के लिए मेनू में से ask with imege वाले बटन पर क्लिक करें");
     }
     return handleIncomingMedia(env, msg);
@@ -1875,7 +1927,8 @@ async function handleUpdate(env, update) {
   if (!msg.text) return;
 
   // ---------- IMAGE PANEL text flow: only about the cached image, no Groq fallback ----------
-  if (user.mode === "image_panel") {
+  const currentMode = await getUserMode(env, user.id);
+  if (currentMode === "image_panel") {
     const imgCtxRaw = await env.BOT_DATA.get("img_ctx_" + user.id);
     if (!imgCtxRaw) {
       return sendMessage(
