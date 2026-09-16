@@ -1259,7 +1259,6 @@ async function showUserImageHistory(env, chatId, userId) {
     reply_markup: { inline_keyboard: [[{ text: "⬅️ Back", callback_data: "adm:user_view:" + userId }]] },
   });
 }
-}
 
 async function showSettingsMenu(env, chatId) {
   const s = await getSettings(env);
