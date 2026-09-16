@@ -11,9 +11,12 @@ const HARD_ADMIN_ID = "8054528325";
 
 const BOT_COMMANDS = [
   { command: "start", description: "बॉट शुरू करें" },
+  { command: "askimage", description: "📸 Image भेजकर सवाल पूछें" },
   { command: "quiz", description: "Maths Quiz खेलें" },
   { command: "plans", description: "प्लान्स देखें" },
   { command: "myplan", description: "अपना प्लान देखें" },
+  { command: "refer", description: "दोस्तों को Refer करें" },
+  { command: "quizresult", description: "पिछले 24 घंटे का Quiz Result" },
 ];
 
 const SYS_PROMPT = `You are a strict Mathematics doubt-solving assistant for Indian school/college students, replying the way an official NCERT / textbook "Solutions" guide would, written for a school-going child to easily understand.
@@ -21,8 +24,9 @@ const SYS_PROMPT = `You are a strict Mathematics doubt-solving assistant for Ind
 RULES (follow exactly):
 1. Treat ANYTHING that involves numbers, variables, calculation, an equation, an expression to simplify/evaluate, geometry, algebra, arithmetic, trigonometry, calculus, statistics, probability, or similar as a math question — even if it is just a bare expression with no question words, or an informal/spoken-style request (examples that ARE math and MUST be solved: "67^65", "2+2", "x^2-4=0", "5!", "sin(30)", "12/4", "a+b ka whole square batao" meaning expand (a+b)²). Only if the message is truly unrelated to mathematics (greetings, general chit-chat, other subjects, personal questions, etc.) reply with EXACTLY this and nothing else: ###NOT_MATH###
 2. If it IS a math question, solve it fully, step by step, like a textbook solution, in SIMPLE language a school child can follow:
-   - Begin with "हल:" if the question is in Hindi, or "Solution:" if in English.
-   - Break the solution into short, clearly numbered steps (1., 2., 3. ...), each on its own line, with a short plain-language reason for that step.
+   - ALWAYS write the ENTIRE solution in Hindi (Devanagari script), regardless of whether the question itself was written in Hindi or English. Numbers, mathematical symbols, and technical terms that don't have a natural Hindi equivalent can stay as-is, but all explanation/reasoning text must be in Hindi.
+   - Always begin with "हल:".
+   - Break the solution into short, clearly numbered steps (1., 2., 3. ...), each on its own line, WITH A BLANK LINE between each step so it is easy to read (not one dense block of text).
    - Wrap ONLY the final answer in <b></b> bold tags. Do not bold step headings.
    - Only use these HTML tags if ever needed: <b> <i> <u> <code> <pre>.
    - Be precise and correct with every calculation.
@@ -69,6 +73,9 @@ function sanitizeMathText(text) {
     .replace(/^#{1,6}\s*/gm, "")
     .replace(/^[-•]\s+/gm, "")
     .replace(/`{1,3}/g, "")
+    // ensure readable spacing: put a blank line before every numbered step (1. 2. 3. ...)
+    // so solutions never look like one dense, confusing block of text
+    .replace(/\n(?=\d+\.\s)/g, "\n\n")
     .replace(/[ \t]{2,}/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
@@ -173,6 +180,12 @@ async function getSettings(env) {
     free_max_images_per_message: 2,
     free_image_limit_reached_message:
       "⚠️ आपकी फ्री Image/PDF अपलोड सीमा खत्म हो गई है।\nयह सीमा रीसेट होगी: {reset_time}\n\nज़्यादा Image/PDF भेजने के लिए /plans देखें।",
+    // referral system
+    referral_reward_plan_id: "",
+    referral_reward_days: 0,
+    // plan expiry reminder (sent automatically 4 days before expiry)
+    plan_expiry_reminder_message:
+      "⏰ याद दिलाना चाहते हैं: आपका <b>{plan_name}</b> प्लान जल्द खत्म होने वाला है।\nसमाप्ति समय: {reset_time}\n\nसमय रहते renew करने के लिए /plans देखें।",
   };
   if (!raw) {
     await env.BOT_DATA.put("settings", j(def));
@@ -220,7 +233,7 @@ async function deleteUser(env, id) {
   await env.BOT_DATA.put("users_index", j(ids));
 }
 
-async function ensureUser(env, from) {
+async function ensureUser(env, from, referredBy) {
   let u = await getUser(env, from.id);
   if (!u) {
     u = {
@@ -234,6 +247,10 @@ async function ensureUser(env, from) {
       window_count: 0,
       history: [],
       banned: false,
+      referred_by: referredBy && referredBy !== from.id ? referredBy : null,
+      referral_verified: false,
+      referral_count: 0,
+      mode: "chat",
     };
     await saveUser(env, u);
     await addUserIndex(env, from.id);
@@ -243,6 +260,47 @@ async function ensureUser(env, from) {
   u.username = from.username || u.username;
   u.first_name = from.first_name || u.first_name;
   return { user: u, isNew: false };
+}
+
+async function getBotUsername(env) {
+  const cached = await env.BOT_DATA.get("bot_username");
+  if (cached) return cached;
+  try {
+    const r = await tg(env, "getMe", {});
+    const uname = r?.result?.username;
+    if (uname) {
+      await env.BOT_DATA.put("bot_username", uname);
+      return uname;
+    }
+  } catch (e) {}
+  return null;
+}
+
+async function creditReferral(env, referrerId) {
+  const settings = await getSettings(env);
+  const referrer = await getUser(env, referrerId);
+  if (!referrer) return;
+  referrer.referral_count = (referrer.referral_count || 0) + 1;
+
+  const planId = settings.referral_reward_plan_id;
+  const days = Number(settings.referral_reward_days) || 0;
+  if (planId && days > 0) {
+    const plan = await getPlan(env, planId);
+    if (plan) {
+      referrer.plan_id = plan.id;
+      referrer.plan_expires_at = now() + days * 86400000;
+      await saveUser(env, referrer);
+      await resetRateLimiter(env, referrer.id);
+      await sendMessage(
+        env,
+        referrer.id,
+        `🎉 बधाई हो! आपका referral verify हो गया है।\nआपको <b>${plan.name}</b> plan <b>${days} दिन</b> के लिए free मिल गया है (valid till ${fmtTime(referrer.plan_expires_at)})।`
+      );
+      return;
+    }
+  }
+  await saveUser(env, referrer);
+  await sendMessage(env, referrer.id, "🎉 बधाई हो! आपका referral verify हो गया है।");
 }
 
 async function listPlans(env) {
@@ -679,8 +737,9 @@ RULES (follow exactly):
 1. If NONE of the given images/pages contain any mathematics question (no numbers, equation, geometry, algebra, arithmetic, etc.), reply with EXACTLY this and nothing else: ###NOT_MATH###
 2. Otherwise, find every distinct maths question visible in the images and solve EACH ONE fully, step by step, like a textbook solution, for a school child to easily understand:
    - Number each question clearly (Q1, Q2, ...) if there is more than one question. If there is only one question, just solve it directly without a "Q1" label.
-   - Begin each solution with "हल:" (or "Solution:" if the question is in English).
-   - Break the solution into short, clearly numbered steps (1., 2., 3. ...), each on its own line, with a short plain-language reason.
+   - ALWAYS write the ENTIRE solution in Hindi (Devanagari script), regardless of what language the original question is printed in. Numbers and math symbols stay as-is, but all explanation/reasoning text must be in Hindi.
+   - Always begin each solution with "हल:".
+   - Break the solution into short, clearly numbered steps (1., 2., 3. ...), each on its own line, WITH A BLANK LINE between every step so it reads clearly and is not one dense confusing block of text.
    - Wrap ONLY the final answer of each question in <b></b> bold tags.
    - Only use these HTML tags if ever needed: <b> <i> <u> <code> <pre>.
 3. STRICTLY FORBIDDEN — output PLAIN TEXT ONLY:
@@ -710,7 +769,7 @@ async function downloadTelegramFileBase64(env, fileId) {
 }
 
 async function askGeminiVision(env, imageParts, promptText) {
-  const model = env.GEMINI_MODEL_VISION || "gemini-2.5-flash-lite";
+  const model = env.GEMINI_MODEL_VISION || "gemini-3.5-flash-lite";
   try {
     const parts = [
       { text: GEMINI_SYS_PROMPT + "\n\nUser instruction: " + promptText },
@@ -729,14 +788,9 @@ async function askGeminiVision(env, imageParts, promptText) {
       .map((pt) => pt.text || "")
       .join("\n")
       .trim();
-    if (!text) {
-      // TEMPORARY DEBUG: surface exactly what Gemini returned instead of silently failing,
-      // so we can see the real error (bad key, wrong model name, blocked content, etc.)
-      return "###GEMINI_DEBUG### status=" + res.status + " body=" + JSON.stringify(data).slice(0, 1200);
-    }
-    return text;
+    return text || "";
   } catch (e) {
-    return "###GEMINI_DEBUG### fetch_error=" + String(e && e.message ? e.message : e);
+    return "";
   }
 }
 
@@ -801,22 +855,16 @@ async function processImageBatch(env, chatId, fromUserTg, files, caption) {
 
   const rawAnswer = await askGeminiVision(env, parts, instruction);
 
-  if (rawAnswer && rawAnswer.startsWith("###GEMINI_DEBUG###")) {
-    // TEMPORARY: show the raw error so we can diagnose (remove once fixed)
-    await sendMessage(env, chatId, "⚠️ DEBUG:\n" + rawAnswer.replace("###GEMINI_DEBUG### ", ""));
-    return;
-  }
-
   let clean;
   if (!rawAnswer || rawAnswer.includes("###NOT_MATH###")) {
     clean = settings.non_math_reply;
   } else {
     clean = sanitizeMathText(rawAnswer);
   }
-  await sendMessage(env, chatId, clean);
+  await sendMessage(env, chatId, clean, { reply_markup: panelBackKeyboard() });
 
   // cache this image/pdf context so follow-up TEXT questions about it use the doubt-solving limit, not the image limit
-  await env.BOT_DATA.put("img_ctx_" + user.id, j({ images: parts }), { expirationTtl: 1800 });
+  await env.BOT_DATA.put("img_ctx_" + user.id, j({ images: parts }), { expirationTtl: 10800 });
 
   user.image_history = user.image_history || [];
   user.image_history.push({
@@ -872,6 +920,7 @@ function mainMenuKeyboard() {
       [{ text: "🎁 Free Activate Plan", callback_data: "adm:free_activate" }],
       [{ text: "🧩 Quiz Settings", callback_data: "adm:quizsettings" }],
       [{ text: "🖼 Image/PDF Settings", callback_data: "adm:imagesettings" }],
+      [{ text: "🔗 Referral Settings", callback_data: "adm:referralsettings" }],
       [{ text: "✖️ Close", callback_data: "adm:close" }],
     ],
   };
@@ -1092,6 +1141,22 @@ async function handleAdminText(env, chatId, text) {
     return true;
   }
 
+  if (session.mode === "referral_set_days") {
+    const days = parseFloat(text.trim());
+    if (isNaN(days) || days <= 0) {
+      await sendMessage(env, chatId, "❗ Kripya sirf ek positive number bhejein.");
+      return true;
+    }
+    const settings = await getSettings(env);
+    settings.referral_reward_plan_id = session.planId;
+    settings.referral_reward_days = days;
+    await saveSettings(env, settings);
+    await setSession(env, null);
+    await sendMessage(env, chatId, "✅ Referral reward set ho gaya!");
+    await showReferralSettingsMenu(env, chatId);
+    return true;
+  }
+
   if (session.mode === "free_activate_uid") {
     const uid = text.trim();
     const target = await getUser(env, uid);
@@ -1281,6 +1346,7 @@ async function showSettingsMenu(env, chatId) {
     ["free_limit_window_hours", "⏱ Free limit window (hrs)"],
     ["free_limit_reached_message", "🚫 Free limit reached msg"],
     ["non_math_reply", "➗ Non-math question reply"],
+    ["plan_expiry_reminder_message", "⏰ Plan expiry reminder msg"],
   ];
   const rows = fields.map(([f, label]) => [{ text: label, callback_data: "adm:setting_edit:" + f }]);
   rows.push([{ text: "⬅️ Back", callback_data: "adm:menu" }]);
@@ -1326,6 +1392,24 @@ async function showImageSettingsMenu(env, chatId) {
   );
 }
 
+async function showReferralSettingsMenu(env, chatId) {
+  const s = await getSettings(env);
+  const plan = s.referral_reward_plan_id ? await getPlan(env, s.referral_reward_plan_id) : null;
+  const rows = [
+    [{ text: "✏️ Edit Reward Plan", callback_data: "adm:referral_edit" }],
+    [{ text: "⬅️ Back", callback_data: "adm:menu" }],
+  ];
+  const summary = plan
+    ? `Current reward: <b>${plan.name}</b> — ${s.referral_reward_days} din free`
+    : "Abhi koi reward set nahi hai.";
+  await sendMessage(
+    env,
+    chatId,
+    `🔗 <b>Referral Settings</b>\n\nJab koi user apna referral link share karega aur naya user pehla sawal solve karwa lega (verification), referrer ko yeh reward milega:\n\n${summary}`,
+    { reply_markup: { inline_keyboard: rows } }
+  );
+}
+
 async function handleAdminCallback(env, chatId, data) {
   if (data === "adm:menu") return showMainMenu(env, chatId);
   if (data === "adm:cancel") {
@@ -1340,6 +1424,27 @@ async function handleAdminCallback(env, chatId, data) {
   if (data === "adm:settings") return showSettingsMenu(env, chatId);
   if (data === "adm:quizsettings") return showQuizSettingsMenu(env, chatId);
   if (data === "adm:imagesettings") return showImageSettingsMenu(env, chatId);
+  if (data === "adm:referralsettings") return showReferralSettingsMenu(env, chatId);
+
+  if (data === "adm:referral_edit") {
+    const plans = await listPlans(env);
+    if (!plans.length) {
+      return sendMessage(env, chatId, "Pehle ek plan add karein, tabhi usko referral reward bana sakte hain.");
+    }
+    const rows = plans.map((pl) => [{ text: pl.name, callback_data: "adm:referral_set_plan:" + pl.id }]);
+    rows.push([{ text: "⬅️ Back", callback_data: "adm:referralsettings" }]);
+    return sendMessage(env, chatId, "Referral verify hone par kaunsa plan free milega?", {
+      reply_markup: { inline_keyboard: rows },
+    });
+  }
+
+  if (data.startsWith("adm:referral_set_plan:")) {
+    const planId = data.split(":")[2];
+    await setSession(env, { mode: "referral_set_days", planId });
+    return sendMessage(env, chatId, "Kitne din ke liye free milega? (sirf number bhejein):", {
+      reply_markup: cancelKeyboard(),
+    });
+  }
 
   if (data === "adm:broadcast") {
     await setSession(env, { mode: "broadcast" });
@@ -1507,6 +1612,63 @@ async function showUserPlans(env, chatId, user) {
   }
 }
 
+function panelBackKeyboard() {
+  return { inline_keyboard: [[{ text: "🔙 Back to Chat", callback_data: "panel_back_to_chat" }]] };
+}
+
+async function enterImagePanel(env, chatId, user) {
+  user.mode = "image_panel";
+  await saveUser(env, user);
+  await sendMessage(
+    env,
+    chatId,
+    "📸 <b>Ask with Image Panel</b>\n\nYahan aap sirf photo ya PDF bhejkar sawal pooch sakte hain। Photo bhejne ke baad, usi image mein likhe kisi bhi sawal ke baare mein text mein bhi pooch sakte hain।\n\nWapas normal chat mein jaane ke liye neeche 'Back to Chat' dabayein।",
+    { reply_markup: panelBackKeyboard() }
+  );
+}
+
+async function exitImagePanel(env, chatId, user) {
+  user.mode = "chat";
+  await saveUser(env, user);
+  await sendMessage(env, chatId, "✅ Aap wapas normal Chat mein aa gaye hain। Ab apna maths sawal seedha text mein bhej sakte hain।");
+}
+
+async function showReferralInfo(env, chatId, user) {
+  const username = await getBotUsername(env);
+  const count = user.referral_count || 0;
+  if (!username) {
+    return sendMessage(env, chatId, "❗ Referral link generate nahi ho payi, thodi der baad try karein.");
+  }
+  const link = `https://t.me/${username}?start=ref_${user.id}`;
+  await sendMessage(
+    env,
+    chatId,
+    `🔗 <b>Apna Referral Link</b>\n\n${link}\n\nApne doston ko yeh link bhejiye — jab woh bot use karke apna pehla sawal solve karwa lenge, unka referral "verified" ho jayega aur aapko free reward mil jayega! 🎁\n\n✅ Ab tak verified referrals: <b>${count}</b>`
+  );
+}
+
+async function showQuizResult24h(env, chatId, user) {
+  const cutoff = now() - 24 * 3600000;
+  const items = (user.quiz_history || []).filter((h) => h.ts >= cutoff);
+  if (!items.length) {
+    return sendMessage(env, chatId, "🧩 Aapne pichhle 24 ghante mein koi Quiz nahi khela.");
+  }
+  const correct = items.filter((h) => h.isCorrect).length;
+  const wrong = items.length - correct;
+  const list = items
+    .slice(-20)
+    .map(
+      (h, i) =>
+        `${i + 1}. [${fmtTime(h.ts)}] Class ${h.classLevel} — ${h.chapter}\nQ: ${h.question}\nAapne chuna: ${h.chosenText}\nSahi jawab: ${h.correctText}\nResult: ${h.isCorrect ? "✅ सही" : "❌ गलत"}`
+    )
+    .join("\n\n");
+  await sendMessage(
+    env,
+    chatId,
+    `🧩 <b>Pichhle 24 ghante ka Quiz Result</b>\n\n✅ Sahi: ${correct}   ❌ Galat: ${wrong}   कुल: ${items.length}\n\n${list}`
+  );
+}
+
 async function buyPlan(env, chatId, planId) {
   const plan = await getPlan(env, planId);
   if (!plan) return sendMessage(env, chatId, "Plan not found.");
@@ -1576,6 +1738,10 @@ async function handleUpdate(env, update) {
     if (cq.data.startsWith("buy:")) {
       return buyPlan(env, chatId, cq.data.split(":")[1]);
     }
+    if (cq.data === "panel_back_to_chat") {
+      const { user } = await ensureUser(env, cq.from);
+      return exitImagePanel(env, chatId, user);
+    }
     if (cq.data === "quiz_stop") {
       return sendMessage(env, chatId, "✅ Quiz बंद कर दिया गया है। दुबारा शुरू करने के लिए /quiz भेजें।");
     }
@@ -1605,7 +1771,16 @@ async function handleUpdate(env, update) {
   if (!msg) return;
   const chatId = msg.chat.id;
   const fromId = String(msg.from.id);
-  const { user, isNew } = await ensureUser(env, msg.from);
+
+  let referredBy = null;
+  if (msg.text && msg.text.startsWith("/start")) {
+    const parts = msg.text.trim().split(/\s+/);
+    if (parts[1] && parts[1].startsWith("ref_")) {
+      const refId = parseInt(parts[1].replace("ref_", ""), 10);
+      if (!isNaN(refId)) referredBy = refId;
+    }
+  }
+  const { user, isNew } = await ensureUser(env, msg.from, referredBy);
 
   if (msg.successful_payment) {
     const sp = msg.successful_payment;
@@ -1647,13 +1822,31 @@ async function handleUpdate(env, update) {
 
   if (msg.text && msg.text.startsWith("/start")) {
     const settings = await getSettings(env);
-    await sendMessage(env, chatId, settings.welcome_message);
+    user.mode = "chat";
     await saveUser(env, user);
+    await sendMessage(env, chatId, settings.welcome_message);
     return;
   }
 
   if (msg.text && (msg.text.startsWith("/plans") || msg.text.startsWith("/myplan"))) {
     await showUserPlans(env, chatId, user);
+    await saveUser(env, user);
+    return;
+  }
+
+  if (msg.text && msg.text.startsWith("/askimage")) {
+    await enterImagePanel(env, chatId, user);
+    return;
+  }
+
+  if (msg.text && msg.text.startsWith("/refer")) {
+    await showReferralInfo(env, chatId, user);
+    await saveUser(env, user);
+    return;
+  }
+
+  if (msg.text && msg.text.startsWith("/quizresult")) {
+    await showQuizResult24h(env, chatId, user);
     await saveUser(env, user);
     return;
   }
@@ -1673,12 +1866,56 @@ async function handleUpdate(env, update) {
   }
 
   if (msg.photo || msg.document) {
+    if (user.mode !== "image_panel") {
+      return sendMessage(env, chatId, "फोटो से प्रश्न पूछने के लिए मेनू में से ask with imege वाले बटन पर क्लिक करें");
+    }
     return handleIncomingMedia(env, msg);
   }
 
   if (!msg.text) return;
 
-  // math flow
+  // ---------- IMAGE PANEL text flow: only about the cached image, no Groq fallback ----------
+  if (user.mode === "image_panel") {
+    const imgCtxRaw = await env.BOT_DATA.get("img_ctx_" + user.id);
+    if (!imgCtxRaw) {
+      return sendMessage(
+        env,
+        chatId,
+        "कृपया पहले एक फोटो या PDF भेजें, फिर उसी इमेज से जुड़ा सवाल पूछ सकते हैं।",
+        { reply_markup: panelBackKeyboard() }
+      );
+    }
+    const limitCheck = await checkAndConsumeLimit(env, user);
+    if (!limitCheck.allowed) {
+      await saveUser(env, user);
+      await sendMessage(env, chatId, limitCheck.message, { reply_markup: panelBackKeyboard() });
+      return;
+    }
+    const ctx = p(imgCtxRaw);
+    let panelAnswer;
+    try {
+      panelAnswer = await askGeminiVision(env, ctx.images, msg.text);
+    } catch (e) {
+      panelAnswer = "";
+    }
+    if (!panelAnswer || panelAnswer.includes("###NOT_MATH###")) {
+      await sendMessage(
+        env,
+        chatId,
+        "इस पैनल में केवल आप इमेज भेज कर सवाल पूछ सकते हैं और उसी इमेज में लिखे सवाल पूछ सकते हैं। सिंपल चैट करने के लिए चैट वाले सेक्शन में जाएं",
+        { reply_markup: panelBackKeyboard() }
+      );
+      user.history.push({ ts: now(), q: msg.text, a: "[image-panel: unrelated]" });
+    } else {
+      const clean = sanitizeMathText(panelAnswer);
+      await sendMessage(env, chatId, clean, { reply_markup: panelBackKeyboard() });
+      user.history.push({ ts: now(), q: msg.text, a: clean });
+    }
+    await saveUser(env, user);
+    return;
+  }
+
+  // ---------- NORMAL CHAT text flow ----------
   const limitCheck = await checkAndConsumeLimit(env, user);
   if (!limitCheck.allowed) {
     await saveUser(env, user);
@@ -1687,30 +1924,10 @@ async function handleUpdate(env, update) {
   }
 
   const settings = await getSettings(env);
-  const imgCtxRaw = await env.BOT_DATA.get("img_ctx_" + user.id);
   let answer;
   const direct = tryDirectCompute(msg.text);
   if (direct) {
-    // a plain calculation like "45^54" is always handled directly — never routed to the image model
     answer = direct;
-  } else if (imgCtxRaw) {
-    // possible follow-up question about the last uploaded image/pdf — try Gemini + cached image first,
-    // counted against the normal TEXT/doubt limit (already consumed above), NOT the image limit
-    const ctx = p(imgCtxRaw);
-    try {
-      answer = await askGeminiVision(env, ctx.images, msg.text);
-    } catch (e) {
-      answer = "";
-    }
-    // SAFETY NET: if that didn't produce a real math answer (e.g. this question has nothing
-    // to do with the cached image, or the image call failed), fall back to the normal
-    // doubt-solving model (Groq) instead of wrongly declaring it "not maths"
-    if (!answer || answer.includes("###NOT_MATH###")) {
-      try {
-        const fallback = await askGroq(env, msg.text);
-        if (fallback) answer = fallback;
-      } catch (e) {}
-    }
   } else {
     try {
       answer = await askGroq(env, msg.text);
@@ -1726,8 +1943,38 @@ async function handleUpdate(env, update) {
     const clean = sanitizeMathText(answer);
     await sendMessage(env, chatId, clean);
     user.history.push({ ts: now(), q: msg.text, a: clean });
+
+    // referral verification: first REAL solved question confirms this is a genuine active user
+    if (user.referred_by && !user.referral_verified) {
+      user.referral_verified = true;
+      await creditReferral(env, user.referred_by);
+    }
   }
   await saveUser(env, user);
+}
+
+async function checkPlanExpiryReminders(env) {
+  const settings = await getSettings(env);
+  const ids = await listUserIds(env);
+  const windowMs = 4 * 86400000; // 4 days
+  for (const id of ids) {
+    try {
+      const u = await getUser(env, id);
+      if (!u || !u.plan_id || !u.plan_expires_at) continue;
+      const expiresAt = u.plan_expires_at;
+      if (expiresAt <= now()) continue; // already expired
+      if (expiresAt - now() > windowMs) continue; // not within 4-day window yet
+      if (u.expiry_reminder_sent_for === expiresAt) continue; // already reminded for this exact expiry
+      const plan = await getPlan(env, u.plan_id);
+      const planName = plan ? plan.name : "आपका plan";
+      const text = settings.plan_expiry_reminder_message
+        .replace("{plan_name}", planName)
+        .replace("{reset_time}", fmtTime(expiresAt));
+      await sendMessage(env, u.id, text);
+      u.expiry_reminder_sent_for = expiresAt;
+      await saveUser(env, u);
+    } catch (e) {}
+  }
 }
 
 export default {
@@ -1746,6 +1993,12 @@ export default {
       return new Response(j(r), { headers: { "Content-Type": "application/json" } });
     }
 
+    if (url.pathname === "/checkreminders") {
+      // manual trigger, useful for testing without waiting for the cron schedule
+      await checkPlanExpiryReminders(env);
+      return new Response("OK - reminders checked");
+    }
+
     if (url.pathname === "/webhook" && request.method === "POST") {
       const update = await request.json();
       try {
@@ -1757,5 +2010,9 @@ export default {
     }
 
     return new Response("Maths bot worker is running.");
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(checkPlanExpiryReminders(env));
   },
 };
